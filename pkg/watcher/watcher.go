@@ -118,6 +118,12 @@ func getGroupVersionResource(kind string) schema.GroupVersionResource {
 			Version:  "v1",
 			Resource: "secrets",
 		}
+	case "Deployment":
+		return schema.GroupVersionResource{
+			Group:    "apps",
+			Version:  "v1",
+			Resource: "deployments",
+		}
 	// Add more resource types as needed
 	default:
 		return schema.GroupVersionResource{
