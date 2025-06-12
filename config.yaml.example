@@ -1,0 +1,21 @@
+clusterName: "my-cluster"
+
+# List of resources to watch
+resources:
+  - kind: "ConfigMap"
+    namespace: "default"  # empty for all namespaces
+  - kind: "Secret"
+    namespace: "kube-system"
+  # Add more resources as needed
+  # - kind: "Deployment"
+  #   namespace: "apps"
+
+# Email configuration
+# These values can be overridden using environment variables or Kubernetes secrets
+email:
+  smtpHost: "smtp.gmail.com"
+  smtpPort: 587
+  smtpUsername: "your-email@gmail.com"  # Override with SMTP_USERNAME env var
+  smtpPassword: "your-app-specific-password"  # Override with SMTP_PASSWORD env var
+  fromEmail: "your-email@gmail.com"  # Override with FROM_EMAIL env var
+  toEmail: "recipient@example.com"  # Override with TO_EMAIL env var 
