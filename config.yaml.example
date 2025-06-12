@@ -13,9 +13,25 @@ resources:
 # Email configuration
 # These values can be overridden using environment variables or Kubernetes secrets
 email:
-  smtpHost: "smtp.gmail.com"
-  smtpPort: 587
-  smtpUsername: "your-email@gmail.com"  # Override with SMTP_USERNAME env var
-  smtpPassword: "your-app-specific-password"  # Override with SMTP_PASSWORD env var
-  fromEmail: "your-email@gmail.com"  # Override with FROM_EMAIL env var
-  toEmail: "recipient@example.com"  # Override with TO_EMAIL env var 
+  # SMTP server configuration
+  smtpHost: "smtp.example.com"
+  smtpPort: 25  # Common port for non-authenticated SMTP
+  
+  # Authentication settings (optional)
+  useAuth: false  # Set to true if your SMTP server requires authentication
+  # smtpUsername: "your-email@gmail.com"  # Only needed if useAuth is true
+  # smtpPassword: "your-app-specific-password"  # Only needed if useAuth is true
+  
+  # Email addresses
+  fromEmail: "notifications@example.com"
+  toEmail: "recipient@example.com"
+
+# Example with authentication enabled:
+# email:
+#   smtpHost: "smtp.gmail.com"
+#   smtpPort: 587
+#   useAuth: true
+#   smtpUsername: "your-email@gmail.com"
+#   smtpPassword: "your-app-specific-password"
+#   fromEmail: "your-email@gmail.com"
+#   toEmail: "recipient@example.com" 

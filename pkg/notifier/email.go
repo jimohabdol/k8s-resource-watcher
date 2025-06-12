@@ -65,12 +65,20 @@ User: %s
 
 	m.SetBody("text/plain", body)
 
-	d := gomail.NewDialer(
-		n.config.SMTPHost,
-		n.config.SMTPPort,
-		n.config.SMTPUsername,
-		n.config.SMTPPassword,
-	)
+	var d *gomail.Dialer
+	if n.config.UseAuth {
+		d = gomail.NewDialer(
+			n.config.SMTPHost,
+			n.config.SMTPPort,
+			n.config.SMTPUsername,
+			n.config.SMTPPassword,
+		)
+	} else {
+		d = &gomail.Dialer{
+			Host: n.config.SMTPHost,
+			Port: n.config.SMTPPort,
+		}
+	}
 
 	return d.DialAndSend(m)
 }
