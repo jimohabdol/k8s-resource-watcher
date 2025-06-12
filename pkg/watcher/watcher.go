@@ -66,6 +66,7 @@ func (w *ResourceWatcher) Start(ctx context.Context) error {
 
 func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig config.ResourceConfig) {
 	gvr := getGroupVersionResource(resourceConfig.Kind)
+	log.Printf("Starting to watch %s in namespace %s", resourceConfig.Kind, resourceConfig.Namespace)
 
 	for {
 		watcher, err := w.client.Resource(gvr).
@@ -95,10 +96,41 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 				Timestamp:    time.Now(),
 			}
 
+			// Log the event details
+			switch event.Type {
+			case "ADDED":
+				log.Printf("[%s] Resource %s/%s was CREATED by %s",
+					resourceConfig.Kind,
+					metadata.GetNamespace(),
+					metadata.GetName(),
+					user)
+			case "MODIFIED":
+				log.Printf("[%s] Resource %s/%s was MODIFIED by %s",
+					resourceConfig.Kind,
+					metadata.GetNamespace(),
+					metadata.GetName(),
+					user)
+			case "DELETED":
+				log.Printf("[%s] Resource %s/%s was DELETED by %s",
+					resourceConfig.Kind,
+					metadata.GetNamespace(),
+					metadata.GetName(),
+					user)
+			default:
+				log.Printf("[%s] Resource %s/%s had event %s by %s",
+					resourceConfig.Kind,
+					metadata.GetNamespace(),
+					metadata.GetName(),
+					event.Type,
+					user)
+			}
+
 			w.eventHandler(resourceEvent)
 		}
 
 		// If we get here, the watch has ended, retry after a delay
+		log.Printf("Watch ended for %s in namespace %s, retrying in 5 seconds...",
+			resourceConfig.Kind, resourceConfig.Namespace)
 		time.Sleep(5 * time.Second)
 	}
 }

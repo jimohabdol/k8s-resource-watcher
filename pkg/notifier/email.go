@@ -5,6 +5,8 @@ import (
 	"k8s-resource-watcher/pkg/config"
 	"k8s-resource-watcher/pkg/watcher"
 
+	"log"
+
 	"gopkg.in/gomail.v2"
 )
 
@@ -80,5 +82,15 @@ User: %s
 		}
 	}
 
-	return d.DialAndSend(m)
+	log.Printf("Attempting to send email notification for %s %s in namespace %s",
+		event.ResourceKind, event.ResourceName, event.Namespace)
+
+	if err := d.DialAndSend(m); err != nil {
+		log.Printf("Failed to send email notification: %v", err)
+		return err
+	}
+
+	log.Printf("Successfully sent email notification for %s %s in namespace %s",
+		event.ResourceKind, event.ResourceName, event.Namespace)
+	return nil
 }
