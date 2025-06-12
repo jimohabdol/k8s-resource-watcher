@@ -7,6 +7,7 @@ A robust Go application that watches Kubernetes resources and sends email notifi
 - Watch multiple Kubernetes resources (ConfigMaps, Secrets, etc.)
 - Configurable resource types and namespaces
 - Email notifications for resource changes (create, update, delete)
+- Supports both authenticated and non-authenticated SMTP servers
 - Captures user information from change-cause annotations
 - Works both in-cluster and out-of-cluster
 - Graceful shutdown handling
@@ -19,7 +20,7 @@ A robust Go application that watches Kubernetes resources and sends email notifi
 - Go 1.21 or higher (for development)
 - Docker (for building container)
 - Access to a Kubernetes cluster
-- SMTP server access for email notifications
+- SMTP server access for email notifications (with or without authentication)
 
 ## Configuration
 
@@ -31,8 +32,25 @@ The application uses a hierarchical configuration system with the following prio
 
 ### Configuration File
 
-The application is configured via a YAML file (`config.yaml`):
+The application is configured via a YAML file (`config.yaml`). Here are examples for both authenticated and non-authenticated SMTP servers:
 
+#### Non-Authenticated SMTP (Local/Internal Server)
+```yaml
+clusterName: "my-cluster"
+resources:
+  - kind: "ConfigMap"
+    namespace: "default"
+  - kind: "Secret"
+    namespace: "kube-system"
+email:
+  smtpHost: "smtp.example.com"
+  smtpPort: 25  # Standard SMTP port
+  useAuth: false
+  fromEmail: "notifications@example.com"
+  toEmail: "recipient@example.com"
+```
+
+#### Authenticated SMTP (e.g., Gmail)
 ```yaml
 clusterName: "my-cluster"
 resources:
@@ -42,7 +60,8 @@ resources:
     namespace: "kube-system"
 email:
   smtpHost: "smtp.gmail.com"
-  smtpPort: 587
+  smtpPort: 587  # TLS port
+  useAuth: true
   smtpUsername: "your-email@gmail.com"
   smtpPassword: "your-app-specific-password"
   fromEmail: "your-email@gmail.com"
@@ -55,14 +74,15 @@ The following environment variables can override the configuration:
 
 - `SMTP_HOST`: SMTP server hostname
 - `SMTP_PORT`: SMTP server port
-- `SMTP_USERNAME`: SMTP username
-- `SMTP_PASSWORD`: SMTP password
+- `SMTP_USE_AUTH`: Set to "true" if authentication is required
+- `SMTP_USERNAME`: SMTP username (only needed if authentication is enabled)
+- `SMTP_PASSWORD`: SMTP password (only needed if authentication is enabled)
 - `FROM_EMAIL`: Sender email address
 - `TO_EMAIL`: Recipient email address
 
 ### Kubernetes Secrets
 
-When running in Kubernetes, sensitive data can be stored in a Secret:
+When running in Kubernetes with authentication enabled, sensitive data can be stored in a Secret:
 
 ```yaml
 apiVersion: v1
@@ -124,7 +144,7 @@ stringData:
    kubectl apply -f k8s/rbac.yaml
    ```
 
-2. Create the email configuration secret:
+2. Create the email configuration secret (if using authentication):
    ```bash
    # Update k8s/secret.yaml with your settings first
    kubectl apply -f k8s/secret.yaml
@@ -164,7 +184,7 @@ These endpoints are used by Kubernetes to monitor the application's health.
    - Resource limits enforced
 
 3. Sensitive Data:
-   - Email credentials stored in Kubernetes Secrets
+   - Email credentials stored in Kubernetes Secrets (when authentication is enabled)
    - Configuration priority system for secure overrides
    - No hardcoded sensitive values
 
@@ -172,8 +192,14 @@ These endpoints are used by Kubernetes to monitor the application's health.
 
 1. Email Configuration Issues:
    - Check the logs for email sending errors
-   - Verify secret mounting in the pod
+   - Verify secret mounting in the pod (if using authentication)
    - Confirm environment variables are set correctly
+   - For authenticated SMTP:
+     - Verify username and password are correct
+     - Check if the SMTP server requires TLS/SSL
+   - For non-authenticated SMTP:
+     - Ensure the SMTP server is accessible
+     - Check if the server allows relay from your IP
 
 2. Resource Watching Issues:
    - Verify RBAC permissions

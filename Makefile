@@ -29,14 +29,14 @@ run:
 
 deploy:
 	kubectl apply -f k8s/rbac.yaml
+	kubectl apply -f k8s/configmap.yaml
 	kubectl apply -f k8s/secret.yaml
-	kubectl create configmap resource-watcher-config --from-file=config.yaml -o yaml --dry-run=client | kubectl apply -f -
 	kubectl apply -f k8s/deployment.yaml
 	kubectl apply -f k8s/service.yaml
 
 undeploy:
 	kubectl delete -f k8s/service.yaml
 	kubectl delete -f k8s/deployment.yaml
-	kubectl delete configmap resource-watcher-config
+	kubectl delete -f k8s/configmap.yaml
 	kubectl delete -f k8s/secret.yaml
 	kubectl delete -f k8s/rbac.yaml 
