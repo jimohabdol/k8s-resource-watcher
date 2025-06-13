@@ -133,6 +133,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		if err != nil {
 			log.Printf("Error watching %s in namespace %s: %v",
 				resourceConfig.Kind, resourceConfig.Namespace, err)
+			w.metrics.WatchErrors++
 			time.Sleep(backoff.Step())
 			continue
 		}
@@ -175,13 +176,17 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 				ResourceVersion: metadata.GetResourceVersion(),
 			}
 
-			// Log the event
+			// Update metrics
+			w.metrics.EventsReceived++
+			w.metrics.LastResourceVersion = metadata.GetResourceVersion()
+
+			// Log the event and send notification
 			switch event.Type {
 			case "ADDED":
-				log.Printf("[%s] Resource %s/%s was CREATED by %s",
+				log.Printf("[%s] Resource %s/%s was ADDED by %s",
 					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 				w.notifier.SendNotification(notifier.NotificationEvent{
-					EventType:    "CREATED",
+					EventType:    "ADDED",
 					ResourceKind: resourceConfig.Kind,
 					ResourceName: metadata.GetName(),
 					Namespace:    metadata.GetNamespace(),
@@ -207,13 +212,20 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 					Namespace:    metadata.GetNamespace(),
 					User:         user,
 				})
+			default:
+				log.Printf("Skipping unknown event type: %s", event.Type)
+				w.metrics.EventsSkipped++
+				continue
 			}
+
+			w.metrics.EventsProcessed++
 
 			// Call the event handler
 			w.eventHandler(resourceEvent)
 		}
 
 		// If we get here, the watch has ended
+		w.metrics.WatchReconnects++
 		if resourceConfig.ResourceName != "" {
 			log.Printf("Watch ended for %s '%s' in namespace %s, retrying in 5 seconds...",
 				resourceConfig.Kind, resourceConfig.ResourceName, resourceConfig.Namespace)

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"k8s-resource-watcher/pkg/config"
 	"k8s-resource-watcher/pkg/health"
@@ -52,22 +53,36 @@ func main() {
 	http.HandleFunc("/healthz", healthHandler.LivenessHandler)
 	http.HandleFunc("/readyz", healthHandler.ReadinessHandler)
 
+	// Create server with timeouts
+	server := &http.Server{
+		Addr:         ":" + *port,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
 	// Start health check server
 	go func() {
-		if err := http.ListenAndServe(":"+*port, nil); err != nil {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("Health check server error: %v", err)
 		}
 	}()
 
 	// Create email notifier
-	emailNotifier := notifier.NewEmailNotifier(&cfg.EmailConfig, cfg.ClusterName)
+	emailNotifier := notifier.NewEmailNotifier(&cfg)
 
 	// Create resource watcher
 	resourceWatcher, err := watcher.NewResourceWatcher(&cfg, func(event *watcher.ResourceEvent) {
-		if err := emailNotifier.SendNotification(event); err != nil {
+		if err := emailNotifier.SendNotification(notifier.NotificationEvent{
+			EventType:    string(event.Type),
+			ResourceKind: event.ResourceKind,
+			ResourceName: event.ResourceName,
+			Namespace:    event.Namespace,
+			User:         event.User,
+		}); err != nil {
 			log.Printf("Error sending notification: %v", err)
 		}
-	})
+	}, emailNotifier)
 	if err != nil {
 		log.Fatalf("Error creating resource watcher: %v", err)
 	}
@@ -83,6 +98,15 @@ func main() {
 		<-signalChan
 		log.Println("Received shutdown signal, stopping watchers...")
 		cancel()
+
+		// Create shutdown context with timeout
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+
+		// Shutdown HTTP server
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Error shutting down HTTP server: %v", err)
+		}
 	}()
 
 	// Start watching resources
@@ -93,7 +117,7 @@ func main() {
 	// Mark application as ready
 	healthHandler.SetReady(true)
 	log.Printf("Resource watcher started successfully on cluster '%s' with email notifications to %s",
-		cfg.ClusterName, cfg.EmailConfig.ToEmail)
+		cfg.ClusterName, cfg.Email.ToEmail)
 
 	<-ctx.Done()
 	// Mark application as not ready during shutdown

@@ -53,10 +53,11 @@ func (n *EmailNotifier) SendNotification(event NotificationEvent) error {
 
 	// Skip non-standard events
 	switch event.EventType {
-	case "CREATED", "MODIFIED", "DELETED":
+	case "ADDED", "MODIFIED", "DELETED":
 		// Process these events
 	default:
 		log.Printf("Skipping notification for event type: %s", event.EventType)
+		n.metrics.EmailsSkipped++
 		return nil
 	}
 
@@ -102,13 +103,33 @@ This is an automated notification from the Kubernetes Resource Watcher.
 		ServerName:         n.config.Email.SMTPHost,
 	}
 
-	// Send the email
-	if err := d.DialAndSend(m); err != nil {
-		log.Printf("Failed to send email notification: %v", err)
-		return err
+	// Implement retry logic with exponential backoff
+	maxRetries := 3
+	backoff := 1 * time.Second
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		// Send the email
+		if err := d.DialAndSend(m); err != nil {
+			lastErr = err
+			log.Printf("Failed to send email notification (attempt %d/%d): %v", attempt, maxRetries, err)
+
+			if attempt < maxRetries {
+				// Wait before retrying with exponential backoff
+				time.Sleep(backoff)
+				backoff *= 2 // Exponential backoff
+				continue
+			}
+			n.metrics.EmailsFailed++
+			return fmt.Errorf("failed to send email after %d attempts: %v", maxRetries, lastErr)
+		}
+
+		// Success
+		n.metrics.EmailsSent++
+		log.Printf("Successfully sent email notification for %s %s in namespace %s",
+			event.ResourceKind, event.ResourceName, event.Namespace)
+		return nil
 	}
 
-	log.Printf("Successfully sent email notification for %s %s in namespace %s",
-		event.ResourceKind, event.ResourceName, event.Namespace)
-	return nil
+	return lastErr
 }
