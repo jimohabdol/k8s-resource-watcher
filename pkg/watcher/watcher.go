@@ -4,11 +4,10 @@ import (
 	"context"
 	"fmt"
 	"k8s-resource-watcher/pkg/config"
+	"k8s-resource-watcher/pkg/notifier"
 	"log"
 	"os"
 	"time"
-
-	"k8s-resource-watcher/pkg/notifier"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
