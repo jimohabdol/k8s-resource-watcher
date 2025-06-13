@@ -7,6 +7,7 @@ import (
 	"k8s-resource-watcher/pkg/notifier"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -109,26 +110,94 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		Jitter:   0.1,
 	}
 
+	// Track initial resource versions with TTL
+	type resourceInfo struct {
+		version  string
+		lastSeen time.Time
+	}
+	initialResources := make(map[string]resourceInfo)
+
+	// Cleanup goroutine for the initialResources map
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			now := time.Now()
+			for key, info := range initialResources {
+				// Remove entries older than 24 hours
+				if now.Sub(info.lastSeen) > 24*time.Hour {
+					delete(initialResources, key)
+				}
+			}
+		}
+	}()
+
+	// First, get the list of existing resources with pagination
+	var listOptions metav1.ListOptions
+	if resourceConfig.ResourceName != "" {
+		listOptions = metav1.ListOptions{
+			FieldSelector: fmt.Sprintf("metadata.name=%s", resourceConfig.ResourceName),
+			Limit:         500, // Use pagination
+		}
+	} else {
+		listOptions = metav1.ListOptions{
+			Limit: 500, // Use pagination
+		}
+	}
+
+	// Track the last resource version for reconnection
+	var lastResourceVersion string
+
+	// List existing resources with pagination
 	for {
-		// Create a watch for the resource
+		existingResources, err := w.client.Resource(gvr).Namespace(resourceConfig.Namespace).List(
+			context.Background(),
+			listOptions,
+		)
+		if err != nil {
+			log.Printf("Error listing existing %s in namespace %s: %v",
+				resourceConfig.Kind, resourceConfig.Namespace, err)
+			break
+		}
+
+		// Store resource versions of existing resources
+		for _, item := range existingResources.Items {
+			metadata, err := meta.Accessor(&item)
+			if err != nil {
+				continue
+			}
+			key := fmt.Sprintf("%s/%s", metadata.GetNamespace(), metadata.GetName())
+			initialResources[key] = resourceInfo{
+				version:  metadata.GetResourceVersion(),
+				lastSeen: time.Now(),
+			}
+			lastResourceVersion = metadata.GetResourceVersion()
+		}
+
+		// Check if we need to continue pagination
+		if existingResources.GetContinue() == "" {
+			break
+		}
+		listOptions.Continue = existingResources.GetContinue()
+	}
+
+	for {
+		// Create a watch for the resource with resource version
 		var watch watch.Interface
 		var err error
 
-		if resourceConfig.ResourceName != "" {
-			// Watch specific resource
-			watch, err = w.client.Resource(gvr).Namespace(resourceConfig.Namespace).Watch(
-				context.Background(),
-				metav1.ListOptions{
-					FieldSelector: fmt.Sprintf("metadata.name=%s", resourceConfig.ResourceName),
-				},
-			)
-		} else {
-			// Watch all resources in namespace
-			watch, err = w.client.Resource(gvr).Namespace(resourceConfig.Namespace).Watch(
-				context.Background(),
-				metav1.ListOptions{},
-			)
+		watchOptions := metav1.ListOptions{
+			ResourceVersion: lastResourceVersion,
 		}
+		if resourceConfig.ResourceName != "" {
+			watchOptions.FieldSelector = fmt.Sprintf("metadata.name=%s", resourceConfig.ResourceName)
+		}
+
+		watch, err = w.client.Resource(gvr).Namespace(resourceConfig.Namespace).Watch(
+			context.Background(),
+			watchOptions,
+		)
 
 		if err != nil {
 			log.Printf("Error watching %s in namespace %s: %v",
@@ -157,10 +226,25 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 				continue
 			}
 
+			// Update last resource version
+			lastResourceVersion = metadata.GetResourceVersion()
+
 			// Get the user who made the change
 			user := "unknown"
 			if annotations := metadata.GetAnnotations(); annotations != nil {
+				// Check multiple possible sources for user information
 				if u, ok := annotations["kubernetes.io/change-cause"]; ok {
+					user = u
+				} else if u, ok := annotations["kubectl.kubernetes.io/last-applied-configuration"]; ok {
+					// Try to extract user from kubectl apply
+					if strings.Contains(u, "kubectl") {
+						user = "kubectl"
+					}
+				}
+			}
+			// Check labels as well
+			if labels := metadata.GetLabels(); labels != nil {
+				if u, ok := labels["app.kubernetes.io/created-by"]; ok {
 					user = u
 				}
 			}
@@ -180,18 +264,34 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 			w.metrics.EventsReceived++
 			w.metrics.LastResourceVersion = metadata.GetResourceVersion()
 
+			// Check if this is a new resource or an existing one
+			key := fmt.Sprintf("%s/%s", metadata.GetNamespace(), metadata.GetName())
+			_, isExisting := initialResources[key]
+
 			// Log the event and send notification
 			switch event.Type {
 			case "ADDED":
-				log.Printf("[%s] Resource %s/%s was ADDED by %s",
-					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
-				w.notifier.SendNotification(notifier.NotificationEvent{
-					EventType:    "ADDED",
-					ResourceKind: resourceConfig.Kind,
-					ResourceName: metadata.GetName(),
-					Namespace:    metadata.GetNamespace(),
-					User:         user,
-				})
+				if !isExisting {
+					log.Printf("[%s] New resource %s/%s was ADDED by %s",
+						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
+					w.notifier.SendNotification(notifier.NotificationEvent{
+						EventType:    "ADDED",
+						ResourceKind: resourceConfig.Kind,
+						ResourceName: metadata.GetName(),
+						Namespace:    metadata.GetNamespace(),
+						User:         user,
+					})
+					w.metrics.EventsProcessed++
+				} else {
+					log.Printf("[%s] Existing resource %s/%s was found (no notification sent)",
+						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
+					w.metrics.EventsSkipped++
+				}
+				// Update last seen time
+				initialResources[key] = resourceInfo{
+					version:  metadata.GetResourceVersion(),
+					lastSeen: time.Now(),
+				}
 			case "MODIFIED":
 				log.Printf("[%s] Resource %s/%s was MODIFIED by %s",
 					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
@@ -202,6 +302,12 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 					Namespace:    metadata.GetNamespace(),
 					User:         user,
 				})
+				w.metrics.EventsProcessed++
+				// Update last seen time
+				initialResources[key] = resourceInfo{
+					version:  metadata.GetResourceVersion(),
+					lastSeen: time.Now(),
+				}
 			case "DELETED":
 				log.Printf("[%s] Resource %s/%s was DELETED by %s",
 					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
@@ -212,13 +318,14 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 					Namespace:    metadata.GetNamespace(),
 					User:         user,
 				})
+				w.metrics.EventsProcessed++
+				// Remove from tracking
+				delete(initialResources, key)
 			default:
 				log.Printf("Skipping unknown event type: %s", event.Type)
 				w.metrics.EventsSkipped++
 				continue
 			}
-
-			w.metrics.EventsProcessed++
 
 			// Call the event handler
 			w.eventHandler(resourceEvent)
