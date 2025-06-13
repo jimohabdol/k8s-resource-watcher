@@ -81,6 +81,17 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 	gvr := getGroupVersionResource(resourceConfig.Kind)
 	log.Printf("Starting to watch %s in namespace %s", resourceConfig.Kind, resourceConfig.Namespace)
 
+	// First, verify namespace exists
+	_, err := w.client.Resource(schema.GroupVersionResource{
+		Group:    "",
+		Version:  "v1",
+		Resource: "namespaces",
+	}).Get(ctx, resourceConfig.Namespace, metav1.GetOptions{})
+	if err != nil {
+		log.Printf("Error accessing namespace %s: %v", resourceConfig.Namespace, err)
+		return
+	}
+
 	backoff := time.Second
 	maxBackoff := 30 * time.Second
 

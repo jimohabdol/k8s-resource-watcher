@@ -26,7 +26,7 @@ spec:
         fsGroup: 2000
       containers:
       - name: resource-watcher
-        image: resource-watcher:1.0.0
+        image: resource-watcher:latest
         imagePullPolicy: IfNotPresent
         # Container-specific security context (only essential settings)
         securityContext:
@@ -35,33 +35,32 @@ spec:
             drop: ["ALL"]
         env:
         - name: CLUSTER_NAME
-          valueFrom:
-            configMapKeyRef:
-              name: resource-watcher-config
-              key: clusterName
+          value: "my-cluster"
         - name: SMTP_HOST
           value: "smtp.gmail.com"
         - name: SMTP_PORT
           value: "587"
+        - name: SMTP_USE_AUTH
+          value: "true"
         - name: SMTP_USERNAME
           valueFrom:
             secretKeyRef:
-              name: resource-watcher-email-config
-              key: smtp-username
+              name: smtp-credentials
+              key: username
         - name: SMTP_PASSWORD
           valueFrom:
             secretKeyRef:
-              name: resource-watcher-email-config
-              key: smtp-password
+              name: smtp-credentials
+              key: password
         - name: FROM_EMAIL
           valueFrom:
             secretKeyRef:
-              name: resource-watcher-email-config
+              name: smtp-credentials
               key: from-email
         - name: TO_EMAIL
           valueFrom:
             secretKeyRef:
-              name: resource-watcher-email-config
+              name: smtp-credentials
               key: to-email
         resources:
           requests:
@@ -75,11 +74,11 @@ spec:
           name: http
           protocol: TCP
         volumeMounts:
-        - name: config
+        - name: config-volume
           mountPath: /app/config.yaml
           subPath: config.yaml
           readOnly: true
-        - name: secrets
+        - name: secrets-volume
           mountPath: /etc/resource-watcher/secrets
           readOnly: true
         - name: tmp
@@ -99,12 +98,12 @@ spec:
           periodSeconds: 10
           timeoutSeconds: 5
       volumes:
-      - name: config
+      - name: config-volume
         configMap:
           name: resource-watcher-config
-      - name: secrets
+      - name: secrets-volume
         secret:
-          secretName: resource-watcher-email-config
+          secretName: smtp-credentials
       - name: tmp
         emptyDir: {}
 ---

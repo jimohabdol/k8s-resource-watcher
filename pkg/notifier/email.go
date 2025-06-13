@@ -7,6 +7,8 @@ import (
 	"log"
 	"time"
 
+	"crypto/tls"
+
 	"gopkg.in/gomail.v2"
 )
 
@@ -44,6 +46,28 @@ func (n *EmailNotifier) SendNotification(event *watcher.ResourceEvent) error {
 		n.metrics.EmailsSkipped++
 		log.Printf("Skipping notification for non-standard event type: %s", event.Type)
 		return nil
+	}
+
+	// Log email configuration details
+	log.Printf("Email Configuration: SMTP Host=%s, Port=%d, Auth=%v, From=%s, To=%s",
+		n.config.SMTPHost,
+		n.config.SMTPPort,
+		n.config.UseAuth,
+		n.config.FromEmail,
+		n.config.ToEmail)
+
+	// Validate email configuration
+	if n.config.SMTPHost == "" {
+		return fmt.Errorf("SMTP host is not configured")
+	}
+	if n.config.FromEmail == "" {
+		return fmt.Errorf("From email is not configured")
+	}
+	if n.config.ToEmail == "" {
+		return fmt.Errorf("To email is not configured")
+	}
+	if n.config.UseAuth && (n.config.SMTPUsername == "" || n.config.SMTPPassword == "") {
+		return fmt.Errorf("SMTP authentication is enabled but credentials are missing")
 	}
 
 	m := gomail.NewMessage()
@@ -95,15 +119,21 @@ Resource Version: %s
 			n.config.SMTPUsername,
 			n.config.SMTPPassword,
 		)
+		log.Printf("Using authenticated SMTP connection")
 	} else {
 		d = &gomail.Dialer{
 			Host: n.config.SMTPHost,
 			Port: n.config.SMTPPort,
 		}
+		log.Printf("Using unauthenticated SMTP connection")
 	}
 
-	log.Printf("Attempting to send email notification for %s %s in namespace %s",
-		event.ResourceKind, event.ResourceName, event.Namespace)
+	// Enable TLS
+	d.SSL = false
+	d.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+
+	log.Printf("Attempting to send email notification for %s %s in namespace %s from %s to %s",
+		event.ResourceKind, event.ResourceName, event.Namespace, n.config.FromEmail, n.config.ToEmail)
 
 	// Retry mechanism
 	maxRetries := 3
@@ -112,14 +142,17 @@ Resource Version: %s
 		if err := d.DialAndSend(m); err != nil {
 			lastErr = err
 			log.Printf("Failed to send email notification (attempt %d/%d): %v", i+1, maxRetries, err)
-			time.Sleep(time.Second * time.Duration(i+1)) // Exponential backoff
-			continue
+			if i < maxRetries-1 {
+				time.Sleep(time.Second * time.Duration(i+1)) // Exponential backoff
+				continue
+			}
+		} else {
+			n.metrics.EmailsSent++
+			n.metrics.LastSentTime = time.Now()
+			log.Printf("Successfully sent email notification for %s %s in namespace %s",
+				event.ResourceKind, event.ResourceName, event.Namespace)
+			return nil
 		}
-		n.metrics.EmailsSent++
-		n.metrics.LastSentTime = time.Now()
-		log.Printf("Successfully sent email notification for %s %s in namespace %s",
-			event.ResourceKind, event.ResourceName, event.Namespace)
-		return nil
 	}
 
 	n.metrics.EmailsFailed++
