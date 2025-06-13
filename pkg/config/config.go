@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 // Config represents the application configuration
@@ -21,13 +22,13 @@ type ResourceConfig struct {
 
 // EmailConfig represents the email notification configuration
 type EmailConfig struct {
-	SMTPHost     string `yaml:"smtpHost"`
-	SMTPPort     int    `yaml:"smtpPort"`
-	UseAuth      bool   `yaml:"useAuth"`
-	SMTPUsername string `yaml:"smtpUsername,omitempty"`
-	SMTPPassword string `yaml:"smtpPassword,omitempty"`
-	FromEmail    string `yaml:"fromEmail"`
-	ToEmail      string `yaml:"toEmail"`
+	SMTPHost     string   `yaml:"smtpHost"`
+	SMTPPort     int      `yaml:"smtpPort"`
+	UseAuth      bool     `yaml:"useAuth"`
+	SMTPUsername string   `yaml:"smtpUsername,omitempty"`
+	SMTPPassword string   `yaml:"smtpPassword,omitempty"`
+	FromEmail    string   `yaml:"fromEmail"`
+	ToEmails     []string `yaml:"toEmails"`
 }
 
 // LoadEmailConfig loads email configuration with the following priority:
@@ -47,8 +48,9 @@ func (c *Config) LoadEmailConfig() error {
 	if secretFromEmail, err := os.ReadFile("/etc/resource-watcher/secrets/from-email"); err == nil {
 		c.Email.FromEmail = string(secretFromEmail)
 	}
-	if secretToEmail, err := os.ReadFile("/etc/resource-watcher/secrets/to-email"); err == nil {
-		c.Email.ToEmail = string(secretToEmail)
+	if secretToEmails, err := os.ReadFile("/etc/resource-watcher/secrets/to-emails"); err == nil {
+		// Split the comma-separated list of emails
+		c.Email.ToEmails = strings.Split(strings.TrimSpace(string(secretToEmails)), ",")
 	}
 
 	// Then, check environment variables (highest priority)
@@ -63,8 +65,9 @@ func (c *Config) LoadEmailConfig() error {
 	if fromEmail := os.Getenv("FROM_EMAIL"); fromEmail != "" {
 		c.Email.FromEmail = fromEmail
 	}
-	if toEmail := os.Getenv("TO_EMAIL"); toEmail != "" {
-		c.Email.ToEmail = toEmail
+	if toEmails := os.Getenv("TO_EMAILS"); toEmails != "" {
+		// Split the comma-separated list of emails
+		c.Email.ToEmails = strings.Split(strings.TrimSpace(toEmails), ",")
 	}
 	if smtpHost := os.Getenv("SMTP_HOST"); smtpHost != "" {
 		c.Email.SMTPHost = smtpHost
@@ -86,8 +89,8 @@ func (c *Config) LoadEmailConfig() error {
 	if c.Email.FromEmail == "" {
 		return fmt.Errorf("From email is required")
 	}
-	if c.Email.ToEmail == "" {
-		return fmt.Errorf("To email is required")
+	if len(c.Email.ToEmails) == 0 {
+		return fmt.Errorf("At least one recipient email is required")
 	}
 
 	// Only validate auth credentials if authentication is enabled

@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"k8s-resource-watcher/pkg/config"
@@ -40,7 +41,7 @@ func (n *EmailNotifier) SendNotification(event NotificationEvent) error {
 		n.config.Email.SMTPPort,
 		n.config.Email.UseAuth,
 		n.config.Email.FromEmail,
-		n.config.Email.ToEmail)
+		strings.Join(n.config.Email.ToEmails, ", "))
 
 	// Skip non-standard events
 	switch event.EventType {
@@ -76,7 +77,7 @@ This is an automated notification from the Kubernetes Resource Watcher.
 
 	m := gomail.NewMessage()
 	m.SetHeader("From", n.config.Email.FromEmail)
-	m.SetHeader("To", n.config.Email.ToEmail)
+	m.SetHeader("To", strings.Join(n.config.Email.ToEmails, ", "))
 	m.SetHeader("Subject", subject)
 	m.SetBody("text/plain", body)
 
@@ -117,8 +118,8 @@ This is an automated notification from the Kubernetes Resource Watcher.
 
 		// Success
 		n.metrics.EmailsSent++
-		log.Printf("Successfully sent email notification for %s %s in namespace %s",
-			event.ResourceKind, event.ResourceName, event.Namespace)
+		log.Printf("Successfully sent email notification for %s %s in namespace %s to %s",
+			event.ResourceKind, event.ResourceName, event.Namespace, strings.Join(n.config.Email.ToEmails, ", "))
 		return nil
 	}
 

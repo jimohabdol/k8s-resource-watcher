@@ -24,7 +24,10 @@ email:
   
   # Email addresses
   fromEmail: "notifications@example.com"
-  toEmail: "recipient@example.com"
+  toEmails:  # List of recipient email addresses
+    - "recipient1@example.com"
+    - "recipient2@example.com"
+    - "team@example.com"
 
 # Example with authentication enabled:
 # email:
@@ -34,4 +37,7 @@ email:
 #   smtpUsername: "your-email@gmail.com"
 #   smtpPassword: "your-app-specific-password"
 #   fromEmail: "your-email@gmail.com"
-#   toEmail: "recipient@example.com" 
+#   toEmails:
+#     - "recipient1@example.com"
+#     - "recipient2@example.com"
+#     - "team@example.com" 
