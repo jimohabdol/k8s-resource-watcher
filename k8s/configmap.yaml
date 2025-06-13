@@ -5,24 +5,34 @@ metadata:
   namespace: default
 data:
   config.yaml: |
-    clusterName: "my-cluster"
+    clusterName: "my-cluster"  # Name of your Kubernetes cluster
 
-    # List of resources to watch
     resources:
-      - kind: "ConfigMap"
-        namespace: "default"
-      - kind: "Secret"
-        namespace: "kube-system"
-      - kind: "Deployment"
-        namespace: "default"
+      # Watch all ConfigMaps in the dev namespace
+      - kind: ConfigMap
+        namespace: dev
+      
+      # Watch a specific ConfigMap in the dev namespace
+      - kind: ConfigMap
+        namespace: dev
+        resourceName: dev-config
+      
+      # Watch all Deployments in the prod namespace
+      - kind: Deployment
+        namespace: prod
+      
+      # Watch a specific Deployment in the prod namespace
+      - kind: Deployment
+        namespace: prod
+        resourceName: api-server
 
-    # Email configuration
     email:
-      # SMTP server configuration
-      smtpHost: "smtp.example.com"
-      smtpPort: 25  # Standard SMTP port
-      useAuth: false
-      fromEmail: "notifications@example.com"
+      smtpHost: "smtp.gmail.com"
+      smtpPort: 587
+      useAuth: true
+      smtpUsername: "your-email@gmail.com"
+      smtpPassword: "your-app-password"
+      fromEmail: "your-email@gmail.com"
       toEmail: "recipient@example.com"
 
     # Example with authentication enabled:

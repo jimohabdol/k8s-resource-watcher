@@ -5,28 +5,29 @@ import (
 	"os"
 )
 
-// Config represents the main configuration for the application
+// Config represents the application configuration
 type Config struct {
-	Resources   []ResourceConfig `yaml:"resources"`
-	EmailConfig EmailConfig      `yaml:"email"`
 	ClusterName string           `yaml:"clusterName"`
+	Resources   []ResourceConfig `yaml:"resources"`
+	Email       EmailConfig      `yaml:"email"`
 }
 
-// ResourceConfig defines a Kubernetes resource to watch
+// ResourceConfig represents configuration for a single resource type
 type ResourceConfig struct {
-	Kind      string `yaml:"kind"`      // e.g., "ConfigMap", "Secret"
-	Namespace string `yaml:"namespace"` // namespace to watch, empty means all namespaces
+	Kind         string `yaml:"kind"`
+	Namespace    string `yaml:"namespace"`
+	ResourceName string `yaml:"resourceName,omitempty"`
 }
 
-// EmailConfig contains email notification settings
+// EmailConfig represents the email notification configuration
 type EmailConfig struct {
 	SMTPHost     string `yaml:"smtpHost"`
 	SMTPPort     int    `yaml:"smtpPort"`
-	SMTPUsername string `yaml:"smtpUsername,omitempty"` // Made optional
-	SMTPPassword string `yaml:"smtpPassword,omitempty"` // Made optional
+	UseAuth      bool   `yaml:"useAuth"`
+	SMTPUsername string `yaml:"smtpUsername,omitempty"`
+	SMTPPassword string `yaml:"smtpPassword,omitempty"`
 	FromEmail    string `yaml:"fromEmail"`
 	ToEmail      string `yaml:"toEmail"`
-	UseAuth      bool   `yaml:"useAuth"` // New field to control authentication
 }
 
 // LoadEmailConfig loads email configuration with the following priority:
@@ -36,65 +37,65 @@ type EmailConfig struct {
 func (c *Config) LoadEmailConfig() error {
 	// First, try to load from mounted Kubernetes secrets
 	if secretUsername, err := os.ReadFile("/etc/resource-watcher/secrets/smtp-username"); err == nil {
-		c.EmailConfig.SMTPUsername = string(secretUsername)
-		c.EmailConfig.UseAuth = true
+		c.Email.SMTPUsername = string(secretUsername)
+		c.Email.UseAuth = true
 	}
 	if secretPassword, err := os.ReadFile("/etc/resource-watcher/secrets/smtp-password"); err == nil {
-		c.EmailConfig.SMTPPassword = string(secretPassword)
-		c.EmailConfig.UseAuth = true
+		c.Email.SMTPPassword = string(secretPassword)
+		c.Email.UseAuth = true
 	}
 	if secretFromEmail, err := os.ReadFile("/etc/resource-watcher/secrets/from-email"); err == nil {
-		c.EmailConfig.FromEmail = string(secretFromEmail)
+		c.Email.FromEmail = string(secretFromEmail)
 	}
 	if secretToEmail, err := os.ReadFile("/etc/resource-watcher/secrets/to-email"); err == nil {
-		c.EmailConfig.ToEmail = string(secretToEmail)
+		c.Email.ToEmail = string(secretToEmail)
 	}
 
 	// Then, check environment variables (highest priority)
 	if username := os.Getenv("SMTP_USERNAME"); username != "" {
-		c.EmailConfig.SMTPUsername = username
-		c.EmailConfig.UseAuth = true
+		c.Email.SMTPUsername = username
+		c.Email.UseAuth = true
 	}
 	if password := os.Getenv("SMTP_PASSWORD"); password != "" {
-		c.EmailConfig.SMTPPassword = password
-		c.EmailConfig.UseAuth = true
+		c.Email.SMTPPassword = password
+		c.Email.UseAuth = true
 	}
 	if fromEmail := os.Getenv("FROM_EMAIL"); fromEmail != "" {
-		c.EmailConfig.FromEmail = fromEmail
+		c.Email.FromEmail = fromEmail
 	}
 	if toEmail := os.Getenv("TO_EMAIL"); toEmail != "" {
-		c.EmailConfig.ToEmail = toEmail
+		c.Email.ToEmail = toEmail
 	}
 	if smtpHost := os.Getenv("SMTP_HOST"); smtpHost != "" {
-		c.EmailConfig.SMTPHost = smtpHost
+		c.Email.SMTPHost = smtpHost
 	}
 	if smtpPort := os.Getenv("SMTP_PORT"); smtpPort != "" {
 		var port int
 		if _, err := fmt.Sscanf(smtpPort, "%d", &port); err == nil {
-			c.EmailConfig.SMTPPort = port
+			c.Email.SMTPPort = port
 		}
 	}
 	if useAuth := os.Getenv("SMTP_USE_AUTH"); useAuth != "" {
-		c.EmailConfig.UseAuth = useAuth == "true"
+		c.Email.UseAuth = useAuth == "true"
 	}
 
 	// Validate required fields
-	if c.EmailConfig.SMTPHost == "" {
+	if c.Email.SMTPHost == "" {
 		return fmt.Errorf("SMTP host is required")
 	}
-	if c.EmailConfig.FromEmail == "" {
+	if c.Email.FromEmail == "" {
 		return fmt.Errorf("From email is required")
 	}
-	if c.EmailConfig.ToEmail == "" {
+	if c.Email.ToEmail == "" {
 		return fmt.Errorf("To email is required")
 	}
 
 	// Only validate auth credentials if authentication is enabled
-	if c.EmailConfig.UseAuth {
-		if c.EmailConfig.SMTPUsername == "" {
+	if c.Email.UseAuth {
+		if c.Email.SMTPUsername == "" {
 			return fmt.Errorf("SMTP username is required when authentication is enabled")
 		}
-		if c.EmailConfig.SMTPPassword == "" {
+		if c.Email.SMTPPassword == "" {
 			return fmt.Errorf("SMTP password is required when authentication is enabled")
 		}
 	}

@@ -1,239 +1,224 @@
 # Kubernetes Resource Watcher
 
-A robust Go application that watches Kubernetes resources and sends email notifications when changes occur. The application is designed to be configurable, reliable, and suitable for production use.
+A Kubernetes operator that watches for changes to specified resources and sends email notifications when changes occur. The watcher can monitor specific named resources or all resources of a particular kind in a namespace.
 
 ## Features
 
-- Watch multiple Kubernetes resources (ConfigMaps, Secrets, etc.)
-- Configurable resource types and namespaces
-- Email notifications for resource changes (create, update, delete)
-- Supports both authenticated and non-authenticated SMTP servers
-- Captures user information from change-cause annotations
-- Works both in-cluster and out-of-cluster
-- Graceful shutdown handling
-- Automatic reconnection on watch failures
-- Health check endpoints for monitoring
-- Secure by default (non-root, read-only filesystem)
+- Watch specific named resources or all resources of a kind in a namespace
+- Email notifications for resource changes (CREATED, MODIFIED, DELETED)
+- Configurable SMTP settings with support for authentication
+- Cluster-aware notifications (includes cluster name in notifications)
+- Detailed logging of resource changes and notification attempts
+- Support for multiple resource types (ConfigMaps, Secrets, Deployments)
+- Kubernetes-native deployment with RBAC support
 
 ## Prerequisites
 
-- Go 1.21 or higher (for development)
-- Docker (for building container)
-- Access to a Kubernetes cluster
-- SMTP server access for email notifications (with or without authentication)
+- Kubernetes cluster (v1.16 or later)
+- kubectl configured to access your cluster
+- SMTP server for sending notifications
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone https://github.com/jimohabdol/k8s-resource-watcher.git
+cd k8s-resource-watcher
+```
+
+2. Create the Kubernetes resources:
+```bash
+kubectl apply -f k8s/rbac.yaml
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/deployment.yaml
+```
+
+3. Create a secret for SMTP credentials:
+```bash
+kubectl create secret generic smtp-credentials \
+  --from-literal=username='your-smtp-username' \
+  --from-literal=password='your-smtp-password' \
+  --from-literal=from-email='your-from-email' \
+  --from-literal=to-email='your-to-email'
+```
 
 ## Configuration
 
-The application uses a hierarchical configuration system with the following priority (highest to lowest):
+The watcher is configured through a ConfigMap. Here's an example configuration:
 
-1. Environment Variables
-2. Kubernetes Secrets (when running in K8s)
-3. Configuration File (config.yaml)
-
-### Configuration File
-
-The application is configured via a YAML file (`config.yaml`). Here are examples for both authenticated and non-authenticated SMTP servers:
-
-#### Non-Authenticated SMTP (Local/Internal Server)
 ```yaml
-clusterName: "my-cluster"
-resources:
-  - kind: "ConfigMap"
-    namespace: "default"
-  - kind: "Secret"
-    namespace: "kube-system"
-email:
-  smtpHost: "smtp.example.com"
-  smtpPort: 25  # Standard SMTP port
-  useAuth: false
-  fromEmail: "notifications@example.com"
-  toEmail: "recipient@example.com"
-```
+clusterName: "my-cluster"  # Name of your Kubernetes cluster
 
-#### Authenticated SMTP (e.g., Gmail)
-```yaml
-clusterName: "my-cluster"
 resources:
-  - kind: "ConfigMap"
-    namespace: "default"
-  - kind: "Secret"
-    namespace: "kube-system"
+  # Watch all ConfigMaps in the dev namespace
+  - kind: ConfigMap
+    namespace: dev
+  
+  # Watch a specific ConfigMap in the dev namespace
+  - kind: ConfigMap
+    namespace: dev
+    resourceName: dev-config
+  
+  # Watch all Deployments in the prod namespace
+  - kind: Deployment
+    namespace: prod
+  
+  # Watch a specific Deployment in the prod namespace
+  - kind: Deployment
+    namespace: prod
+    resourceName: api-server
+
 email:
   smtpHost: "smtp.gmail.com"
-  smtpPort: 587  # TLS port
+  smtpPort: 587
   useAuth: true
   smtpUsername: "your-email@gmail.com"
-  smtpPassword: "your-app-specific-password"
+  smtpPassword: "your-app-password"
   fromEmail: "your-email@gmail.com"
   toEmail: "recipient@example.com"
 ```
 
-### Environment Variables
+### Configuration Options
 
-The following environment variables can override the configuration:
+- `clusterName`: Name of your Kubernetes cluster (used in email notifications)
+- `resources`: List of resources to watch
+  - `kind`: Type of resource (ConfigMap, Secret, Deployment)
+  - `namespace`: Namespace to watch
+  - `resourceName`: (Optional) Specific resource to watch. If not specified, watches all resources of the kind in the namespace
+- `email`: SMTP configuration
+  - `smtpHost`: SMTP server hostname
+  - `smtpPort`: SMTP server port
+  - `useAuth`: Whether to use SMTP authentication
+  - `smtpUsername`: SMTP username (if authentication is enabled)
+  - `smtpPassword`: SMTP password (if authentication is enabled)
+  - `fromEmail`: Sender email address
+  - `toEmail`: Recipient email address
 
-- `SMTP_HOST`: SMTP server hostname
-- `SMTP_PORT`: SMTP server port
-- `SMTP_USE_AUTH`: Set to "true" if authentication is required
-- `SMTP_USERNAME`: SMTP username (only needed if authentication is enabled)
-- `SMTP_PASSWORD`: SMTP password (only needed if authentication is enabled)
-- `FROM_EMAIL`: Sender email address
-- `TO_EMAIL`: Recipient email address
+## Usage
 
-### Kubernetes Secrets
+### Watching All Resources
 
-When running in Kubernetes with authentication enabled, sensitive data can be stored in a Secret:
+To watch all resources of a kind in a namespace, omit the `resourceName` field:
 
 ```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: resource-watcher-email-config
-type: Opaque
-stringData:
-  smtp-username: "your-email@gmail.com"
-  smtp-password: "your-app-specific-password"
-  from-email: "your-email@gmail.com"
-  to-email: "recipient@example.com"
+resources:
+  - kind: ConfigMap
+    namespace: dev
 ```
 
-## Installation
+### Watching Specific Resources
 
-### Local Development
+To watch a specific resource, include the `resourceName` field:
 
-1. Clone the repository:
-   ```bash
-   git clone <repository-url>
-   cd k8s-resource-watcher
-   ```
+```yaml
+resources:
+  - kind: ConfigMap
+    namespace: dev
+    resourceName: dev-config
+```
 
-2. Install dependencies:
-   ```bash
-   go mod download
-   ```
+### Testing the Configuration
 
-3. Update the configuration:
-   ```bash
-   cp config.yaml.example config.yaml
-   # Edit config.yaml with your settings
-   ```
+1. Create a test resource:
+```bash
+kubectl create configmap dev-config --from-literal=key=value -n dev
+```
 
-4. Run the application:
-   ```bash
-   go run main.go
-   ```
+2. Modify the resource:
+```bash
+kubectl patch configmap dev-config --patch '{"data":{"key":"new-value"}}' -n dev
+```
 
-### Docker Build
+3. Delete the resource:
+```bash
+kubectl delete configmap dev-config -n dev
+```
 
-1. Build the container:
-   ```bash
-   docker build -t resource-watcher:1.0.0 .
-   ```
-
-2. Run locally (optional):
-   ```bash
-   docker run -v ~/.kube/config:/root/.kube/config:ro \
-     -v $(pwd)/config.yaml:/app/config.yaml:ro \
-     resource-watcher:1.0.0
-   ```
-
-### Kubernetes Deployment
-
-1. Create the RBAC resources:
-   ```bash
-   kubectl apply -f k8s/rbac.yaml
-   ```
-
-2. Create the email configuration secret (if using authentication):
-   ```bash
-   # Update k8s/secret.yaml with your settings first
-   kubectl apply -f k8s/secret.yaml
-   ```
-
-3. Create a ConfigMap with your configuration:
-   ```bash
-   # Update config.yaml with your settings first
-   kubectl create configmap resource-watcher-config --from-file=config.yaml
-   ```
-
-4. Deploy the application:
-   ```bash
-   kubectl apply -f k8s/deployment.yaml
-   ```
-
-## Monitoring and Health Checks
-
-The application exposes the following HTTP endpoints:
-
-- `/healthz`: Liveness probe
-- `/readyz`: Readiness probe
-
-These endpoints are used by Kubernetes to monitor the application's health.
-
-## Security Features
-
-1. RBAC Configuration:
-   - Uses minimal required permissions
-   - Separate ServiceAccount for the application
-   - Cluster-level or namespace-level roles as needed
-
-2. Container Security:
-   - Runs as non-root user (UID 1000)
-   - Read-only root filesystem
-   - No privilege escalation
-   - Resource limits enforced
-
-3. Sensitive Data:
-   - Email credentials stored in Kubernetes Secrets (when authentication is enabled)
-   - Configuration priority system for secure overrides
-   - No hardcoded sensitive values
-
-## Troubleshooting
-
-1. Email Configuration Issues:
-   - Check the logs for email sending errors
-   - Verify secret mounting in the pod (if using authentication)
-   - Confirm environment variables are set correctly
-   - For authenticated SMTP:
-     - Verify username and password are correct
-     - Check if the SMTP server requires TLS/SSL
-   - For non-authenticated SMTP:
-     - Ensure the SMTP server is accessible
-     - Check if the server allows relay from your IP
-
-2. Resource Watching Issues:
-   - Verify RBAC permissions
-   - Check pod logs for connection errors
-   - Ensure correct namespace configuration
-
-3. Common Error Messages:
-   - "Error loading email configuration": Missing required email settings
-   - "Failed to create k8s config": Kubernetes authentication issues
-   - "Error watching resources": RBAC or connectivity issues
-
-## Logging
-
-The application uses structured logging with the following information:
-- Resource changes (create/update/delete)
-- Email notification status
-- Watch connection status
-- Health check status
-
-Access logs using:
+4. Check the logs:
 ```bash
 kubectl logs -f deployment/resource-watcher
 ```
 
-## Resource Requirements
+## Email Notifications
 
-Minimum recommended resources:
-- CPU: 100m
-- Memory: 128Mi
+The watcher sends email notifications for the following events:
+- Resource creation (CREATED)
+- Resource modification (MODIFIED)
+- Resource deletion (DELETED)
 
-Resource limits:
-- CPU: 200m
-- Memory: 256Mi
+Email notifications include:
+- Cluster name
+- Resource kind
+- Resource name
+- Namespace
+- Event type
+- User who made the change
+- Timestamp
 
-## Support
+Example email subject:
+```
+[my-cluster] ConfigMap dev/dev-config was MODIFIED
+```
 
-For issues and feature requests, please create an issue in the repository.
+## Troubleshooting
+
+### Common Issues
+
+1. **No email notifications received**
+   - Check SMTP configuration in ConfigMap
+   - Verify SMTP credentials in Kubernetes secret
+   - Check pod logs for SMTP connection errors
+   - Verify email server settings (port, TLS, authentication)
+
+2. **Resource changes not detected**
+   - Verify RBAC permissions
+   - Check if the resource is in the correct namespace
+   - Ensure the resource kind is supported
+   - Check pod logs for watch errors
+
+3. **Watch connection issues**
+   - Check pod logs for connection errors
+   - Verify network connectivity to Kubernetes API
+   - Check RBAC permissions
+
+### Checking Logs
+
+View the watcher logs:
+```bash
+kubectl logs -f deployment/resource-watcher
+```
+
+The logs will show:
+- Watch initialization
+- Resource changes detected
+- Email notification attempts
+- Any errors or issues
+
+## Development
+
+### Building
+
+Build the Docker image:
+```bash
+docker build -t resource-watcher:latest .
+```
+
+### Running Locally
+
+1. Set up your kubeconfig
+2. Run the watcher:
+```bash
+go run cmd/main.go
+```
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a Pull Request
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
