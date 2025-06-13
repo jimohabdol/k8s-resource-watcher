@@ -80,8 +80,37 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 			continue
 		}
 
+		log.Printf("Watch established for %s in namespace %s", resourceConfig.Kind, resourceConfig.Namespace)
+
 		for event := range watcher.ResultChan() {
-			metadata := event.Object.(metav1.Object)
+			// Skip if the event object is nil
+			if event.Object == nil {
+				log.Printf("Received nil event object for %s in namespace %s",
+					resourceConfig.Kind, resourceConfig.Namespace)
+				continue
+			}
+
+			metadata, ok := event.Object.(metav1.Object)
+			if !ok {
+				log.Printf("Failed to convert event object to metav1.Object for %s in namespace %s",
+					resourceConfig.Kind, resourceConfig.Namespace)
+				continue
+			}
+
+			// Skip if the resource name is empty
+			if metadata.GetName() == "" {
+				log.Printf("Received event with empty resource name for %s in namespace %s",
+					resourceConfig.Kind, resourceConfig.Namespace)
+				continue
+			}
+
+			// Skip if the namespace doesn't match
+			if metadata.GetNamespace() != resourceConfig.Namespace {
+				log.Printf("Skipping event for %s in namespace %s (watching namespace %s)",
+					metadata.GetName(), metadata.GetNamespace(), resourceConfig.Namespace)
+				continue
+			}
+
 			user := ""
 			if annotations := metadata.GetAnnotations(); annotations != nil {
 				user = annotations["kubernetes.io/change-cause"]
@@ -123,6 +152,7 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 					metadata.GetName(),
 					event.Type,
 					user)
+				continue // Skip non-standard events
 			}
 
 			w.eventHandler(resourceEvent)
