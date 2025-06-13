@@ -11,15 +11,6 @@ import (
 	"gopkg.in/gomail.v2"
 )
 
-// NotificationEvent represents a resource event to be notified
-type NotificationEvent struct {
-	EventType    string
-	ResourceKind string
-	ResourceName string
-	Namespace    string
-	User         string
-}
-
 // EmailMetrics tracks metrics for email notifications
 type EmailMetrics struct {
 	EmailsSent    int64
