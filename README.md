@@ -6,6 +6,7 @@ A Kubernetes operator that watches for changes to specified resources and sends 
 
 - Watch specific named resources or all resources of a kind in a namespace
 - Email notifications for resource changes (CREATED, MODIFIED, DELETED)
+- Support for multiple email recipients
 - Configurable SMTP settings with support for authentication
 - Cluster-aware notifications (includes cluster name in notifications)
 - Detailed logging of resource changes and notification attempts
@@ -39,7 +40,7 @@ kubectl create secret generic smtp-credentials \
   --from-literal=username='your-smtp-username' \
   --from-literal=password='your-smtp-password' \
   --from-literal=from-email='your-from-email' \
-  --from-literal=to-email='your-to-email'
+  --from-literal=to-emails='recipient1@example.com,recipient2@example.com,team@example.com'
 ```
 
 ## Configuration
@@ -75,7 +76,10 @@ email:
   smtpUsername: "your-email@gmail.com"
   smtpPassword: "your-app-password"
   fromEmail: "your-email@gmail.com"
-  toEmail: "recipient@example.com"
+  toEmails:  # List of recipient email addresses
+    - "recipient1@example.com"
+    - "recipient2@example.com"
+    - "team@example.com"
 ```
 
 ### Configuration Options
@@ -92,7 +96,7 @@ email:
   - `smtpUsername`: SMTP username (if authentication is enabled)
   - `smtpPassword`: SMTP password (if authentication is enabled)
   - `fromEmail`: Sender email address
-  - `toEmail`: Recipient email address
+  - `toEmails`: List of recipient email addresses
 
 ## Usage
 
@@ -158,6 +162,30 @@ Email notifications include:
 Example email subject:
 ```
 [my-cluster] ConfigMap dev/dev-config was MODIFIED
+```
+
+### Multiple Recipients
+
+You can configure multiple email recipients in several ways:
+
+1. In the config file:
+```yaml
+email:
+  toEmails:
+    - "recipient1@example.com"
+    - "recipient2@example.com"
+    - "team@example.com"
+```
+
+2. In Kubernetes secret:
+```yaml
+stringData:
+  to-emails: "recipient1@example.com,recipient2@example.com,team@example.com"
+```
+
+3. Using environment variable:
+```bash
+export TO_EMAILS="recipient1@example.com,recipient2@example.com,team@example.com"
 ```
 
 ## Troubleshooting

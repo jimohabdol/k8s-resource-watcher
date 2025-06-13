@@ -77,7 +77,10 @@ This is an automated notification from the Kubernetes Resource Watcher.
 
 	m := gomail.NewMessage()
 	m.SetHeader("From", n.config.Email.FromEmail)
-	m.SetHeader("To", strings.Join(n.config.Email.ToEmails, ", "))
+	// Set each recipient individually
+	for _, to := range n.config.Email.ToEmails {
+		m.SetHeader("To", strings.TrimSpace(to))
+	}
 	m.SetHeader("Subject", subject)
 	m.SetBody("text/plain", body)
 
