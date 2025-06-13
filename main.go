@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -117,7 +118,7 @@ func main() {
 	// Mark application as ready
 	healthHandler.SetReady(true)
 	log.Printf("Resource watcher started successfully on cluster '%s' with email notifications to %s",
-		cfg.ClusterName, cfg.Email.ToEmail)
+		cfg.ClusterName, strings.Join(cfg.Email.ToEmails, ", "))
 
 	<-ctx.Done()
 	// Mark application as not ready during shutdown
