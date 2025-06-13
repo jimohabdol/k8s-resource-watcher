@@ -20,16 +20,28 @@ type ResourceWatcher struct {
 	client       dynamic.Interface
 	config       *config.Config
 	eventHandler func(event *ResourceEvent)
+	metrics      *WatcherMetrics
+}
+
+// WatcherMetrics tracks watcher statistics
+type WatcherMetrics struct {
+	EventsReceived      int64
+	EventsProcessed     int64
+	EventsSkipped       int64
+	WatchErrors         int64
+	WatchReconnects     int64
+	LastResourceVersion string
 }
 
 // ResourceEvent represents a Kubernetes resource event
 type ResourceEvent struct {
-	Type         watch.EventType
-	ResourceKind string
-	ResourceName string
-	Namespace    string
-	User         string
-	Timestamp    time.Time
+	Type            watch.EventType
+	ResourceKind    string
+	ResourceName    string
+	Namespace       string
+	User            string
+	Timestamp       time.Time
+	ResourceVersion string
 }
 
 // NewResourceWatcher creates a new watcher instance
@@ -53,6 +65,7 @@ func NewResourceWatcher(cfg *config.Config, eventHandler func(event *ResourceEve
 		client:       client,
 		config:       cfg,
 		eventHandler: eventHandler,
+		metrics:      &WatcherMetrics{},
 	}, nil
 }
 
@@ -68,101 +81,135 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 	gvr := getGroupVersionResource(resourceConfig.Kind)
 	log.Printf("Starting to watch %s in namespace %s", resourceConfig.Kind, resourceConfig.Namespace)
 
+	backoff := time.Second
+	maxBackoff := 30 * time.Second
+
 	for {
-		watcher, err := w.client.Resource(gvr).
-			Namespace(resourceConfig.Namespace).
-			Watch(ctx, metav1.ListOptions{})
+		select {
+		case <-ctx.Done():
+			log.Printf("Watch context cancelled for %s in namespace %s", resourceConfig.Kind, resourceConfig.Namespace)
+			return
+		default:
+			watcher, err := w.client.Resource(gvr).
+				Namespace(resourceConfig.Namespace).
+				Watch(ctx, metav1.ListOptions{
+					ResourceVersion: w.metrics.LastResourceVersion,
+				})
 
-		if err != nil {
-			log.Printf("Error watching %s in namespace %s: %v",
-				resourceConfig.Kind, resourceConfig.Namespace, err)
-			time.Sleep(5 * time.Second)
-			continue
+			if err != nil {
+				w.metrics.WatchErrors++
+				log.Printf("Error watching %s in namespace %s: %v",
+					resourceConfig.Kind, resourceConfig.Namespace, err)
+				time.Sleep(backoff)
+				backoff = min(backoff*2, maxBackoff)
+				continue
+			}
+
+			// Reset backoff on successful watch
+			backoff = time.Second
+			w.metrics.WatchReconnects++
+			log.Printf("Watch established for %s in namespace %s", resourceConfig.Kind, resourceConfig.Namespace)
+
+			for event := range watcher.ResultChan() {
+				w.metrics.EventsReceived++
+
+				// Skip if the event object is nil
+				if event.Object == nil {
+					w.metrics.EventsSkipped++
+					log.Printf("Received nil event object for %s in namespace %s",
+						resourceConfig.Kind, resourceConfig.Namespace)
+					continue
+				}
+
+				metadata, ok := event.Object.(metav1.Object)
+				if !ok {
+					w.metrics.EventsSkipped++
+					log.Printf("Failed to convert event object to metav1.Object for %s in namespace %s",
+						resourceConfig.Kind, resourceConfig.Namespace)
+					continue
+				}
+
+				// Skip if the resource name is empty
+				if metadata.GetName() == "" {
+					w.metrics.EventsSkipped++
+					log.Printf("Received event with empty resource name for %s in namespace %s",
+						resourceConfig.Kind, resourceConfig.Namespace)
+					continue
+				}
+
+				// Skip if the namespace doesn't match
+				if metadata.GetNamespace() != resourceConfig.Namespace {
+					w.metrics.EventsSkipped++
+					log.Printf("Skipping event for %s in namespace %s (watching namespace %s)",
+						metadata.GetName(), metadata.GetNamespace(), resourceConfig.Namespace)
+					continue
+				}
+
+				user := ""
+				if annotations := metadata.GetAnnotations(); annotations != nil {
+					user = annotations["kubernetes.io/change-cause"]
+				}
+
+				resourceEvent := &ResourceEvent{
+					Type:            event.Type,
+					ResourceKind:    resourceConfig.Kind,
+					ResourceName:    metadata.GetName(),
+					Namespace:       metadata.GetNamespace(),
+					User:            user,
+					Timestamp:       time.Now(),
+					ResourceVersion: metadata.GetResourceVersion(),
+				}
+
+				// Log the event details
+				switch event.Type {
+				case "ADDED":
+					log.Printf("[%s] Resource %s/%s was CREATED by %s",
+						resourceConfig.Kind,
+						metadata.GetNamespace(),
+						metadata.GetName(),
+						user)
+				case "MODIFIED":
+					log.Printf("[%s] Resource %s/%s was MODIFIED by %s",
+						resourceConfig.Kind,
+						metadata.GetNamespace(),
+						metadata.GetName(),
+						user)
+				case "DELETED":
+					log.Printf("[%s] Resource %s/%s was DELETED by %s",
+						resourceConfig.Kind,
+						metadata.GetNamespace(),
+						metadata.GetName(),
+						user)
+				default:
+					w.metrics.EventsSkipped++
+					log.Printf("[%s] Resource %s/%s had event %s by %s",
+						resourceConfig.Kind,
+						metadata.GetNamespace(),
+						metadata.GetName(),
+						event.Type,
+						user)
+					continue // Skip non-standard events
+				}
+
+				w.metrics.EventsProcessed++
+				w.metrics.LastResourceVersion = metadata.GetResourceVersion()
+				w.eventHandler(resourceEvent)
+			}
+
+			// If we get here, the watch has ended, retry after a delay
+			log.Printf("Watch ended for %s in namespace %s, retrying in %v...",
+				resourceConfig.Kind, resourceConfig.Namespace, backoff)
+			time.Sleep(backoff)
+			backoff = min(backoff*2, maxBackoff)
 		}
-
-		log.Printf("Watch established for %s in namespace %s", resourceConfig.Kind, resourceConfig.Namespace)
-
-		for event := range watcher.ResultChan() {
-			// Skip if the event object is nil
-			if event.Object == nil {
-				log.Printf("Received nil event object for %s in namespace %s",
-					resourceConfig.Kind, resourceConfig.Namespace)
-				continue
-			}
-
-			metadata, ok := event.Object.(metav1.Object)
-			if !ok {
-				log.Printf("Failed to convert event object to metav1.Object for %s in namespace %s",
-					resourceConfig.Kind, resourceConfig.Namespace)
-				continue
-			}
-
-			// Skip if the resource name is empty
-			if metadata.GetName() == "" {
-				log.Printf("Received event with empty resource name for %s in namespace %s",
-					resourceConfig.Kind, resourceConfig.Namespace)
-				continue
-			}
-
-			// Skip if the namespace doesn't match
-			if metadata.GetNamespace() != resourceConfig.Namespace {
-				log.Printf("Skipping event for %s in namespace %s (watching namespace %s)",
-					metadata.GetName(), metadata.GetNamespace(), resourceConfig.Namespace)
-				continue
-			}
-
-			user := ""
-			if annotations := metadata.GetAnnotations(); annotations != nil {
-				user = annotations["kubernetes.io/change-cause"]
-			}
-
-			resourceEvent := &ResourceEvent{
-				Type:         event.Type,
-				ResourceKind: resourceConfig.Kind,
-				ResourceName: metadata.GetName(),
-				Namespace:    metadata.GetNamespace(),
-				User:         user,
-				Timestamp:    time.Now(),
-			}
-
-			// Log the event details
-			switch event.Type {
-			case "ADDED":
-				log.Printf("[%s] Resource %s/%s was CREATED by %s",
-					resourceConfig.Kind,
-					metadata.GetNamespace(),
-					metadata.GetName(),
-					user)
-			case "MODIFIED":
-				log.Printf("[%s] Resource %s/%s was MODIFIED by %s",
-					resourceConfig.Kind,
-					metadata.GetNamespace(),
-					metadata.GetName(),
-					user)
-			case "DELETED":
-				log.Printf("[%s] Resource %s/%s was DELETED by %s",
-					resourceConfig.Kind,
-					metadata.GetNamespace(),
-					metadata.GetName(),
-					user)
-			default:
-				log.Printf("[%s] Resource %s/%s had event %s by %s",
-					resourceConfig.Kind,
-					metadata.GetNamespace(),
-					metadata.GetName(),
-					event.Type,
-					user)
-				continue // Skip non-standard events
-			}
-
-			w.eventHandler(resourceEvent)
-		}
-
-		// If we get here, the watch has ended, retry after a delay
-		log.Printf("Watch ended for %s in namespace %s, retrying in 5 seconds...",
-			resourceConfig.Kind, resourceConfig.Namespace)
-		time.Sleep(5 * time.Second)
 	}
+}
+
+func min(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func getGroupVersionResource(kind string) schema.GroupVersionResource {

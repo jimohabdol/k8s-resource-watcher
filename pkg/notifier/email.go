@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"k8s-resource-watcher/pkg/config"
 	"k8s-resource-watcher/pkg/watcher"
-
 	"log"
+	"time"
 
 	"gopkg.in/gomail.v2"
 )
@@ -14,6 +14,15 @@ import (
 type EmailNotifier struct {
 	config      *config.EmailConfig
 	clusterName string
+	metrics     *EmailMetrics
+}
+
+// EmailMetrics tracks email notification statistics
+type EmailMetrics struct {
+	EmailsSent    int64
+	EmailsFailed  int64
+	EmailsSkipped int64
+	LastSentTime  time.Time
 }
 
 // NewEmailNotifier creates a new email notifier instance
@@ -21,11 +30,22 @@ func NewEmailNotifier(cfg *config.EmailConfig, clusterName string) *EmailNotifie
 	return &EmailNotifier{
 		config:      cfg,
 		clusterName: clusterName,
+		metrics:     &EmailMetrics{},
 	}
 }
 
 // SendNotification sends an email notification for a resource event
 func (n *EmailNotifier) SendNotification(event *watcher.ResourceEvent) error {
+	// Only process ADDED, MODIFIED, and DELETED events
+	switch event.Type {
+	case "ADDED", "MODIFIED", "DELETED":
+		// Continue with notification
+	default:
+		n.metrics.EmailsSkipped++
+		log.Printf("Skipping notification for non-standard event type: %s", event.Type)
+		return nil
+	}
+
 	m := gomail.NewMessage()
 	m.SetHeader("From", n.config.FromEmail)
 	m.SetHeader("To", n.config.ToEmail)
@@ -38,8 +58,6 @@ func (n *EmailNotifier) SendNotification(event *watcher.ResourceEvent) error {
 		action = "modified"
 	case "DELETED":
 		action = "deleted"
-	default:
-		action = string(event.Type)
 	}
 
 	subject := fmt.Sprintf("[%s] Kubernetes Resource %s: %s/%s", n.clusterName, action, event.Namespace, event.ResourceName)
@@ -55,6 +73,7 @@ Namespace: %s
 Action: %s
 Time: %s
 User: %s
+Resource Version: %s
 `,
 		n.clusterName,
 		event.ResourceKind,
@@ -63,6 +82,7 @@ User: %s
 		action,
 		event.Timestamp.Format("2006-01-02 15:04:05"),
 		event.User,
+		event.ResourceVersion,
 	)
 
 	m.SetBody("text/plain", body)
@@ -85,12 +105,23 @@ User: %s
 	log.Printf("Attempting to send email notification for %s %s in namespace %s",
 		event.ResourceKind, event.ResourceName, event.Namespace)
 
-	if err := d.DialAndSend(m); err != nil {
-		log.Printf("Failed to send email notification: %v", err)
-		return err
+	// Retry mechanism
+	maxRetries := 3
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		if err := d.DialAndSend(m); err != nil {
+			lastErr = err
+			log.Printf("Failed to send email notification (attempt %d/%d): %v", i+1, maxRetries, err)
+			time.Sleep(time.Second * time.Duration(i+1)) // Exponential backoff
+			continue
+		}
+		n.metrics.EmailsSent++
+		n.metrics.LastSentTime = time.Now()
+		log.Printf("Successfully sent email notification for %s %s in namespace %s",
+			event.ResourceKind, event.ResourceName, event.Namespace)
+		return nil
 	}
 
-	log.Printf("Successfully sent email notification for %s %s in namespace %s",
-		event.ResourceKind, event.ResourceName, event.Namespace)
-	return nil
+	n.metrics.EmailsFailed++
+	return fmt.Errorf("failed to send email after %d attempts: %v", maxRetries, lastErr)
 }
