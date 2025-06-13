@@ -27,7 +27,7 @@ type ResourceWatcher struct {
 	config       *config.Config
 	eventHandler func(event *ResourceEvent)
 	metrics      *WatcherMetrics
-	notifier     *notifier.Notifier
+	notifier     notifier.Notifier
 }
 
 // WatcherMetrics tracks watcher statistics
@@ -52,7 +52,7 @@ type ResourceEvent struct {
 }
 
 // NewResourceWatcher creates a new watcher instance
-func NewResourceWatcher(cfg *config.Config, eventHandler func(event *ResourceEvent), notifier *notifier.Notifier) (*ResourceWatcher, error) {
+func NewResourceWatcher(cfg *config.Config, eventHandler func(event *ResourceEvent), notifier notifier.Notifier) (*ResourceWatcher, error) {
 	// Try in-cluster config first
 	k8sConfig, err := rest.InClusterConfig()
 	if err != nil {
@@ -178,7 +178,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 
 			// Log the event
 			switch event.Type {
-			case watch.Added:
+			case "ADDED":
 				log.Printf("[%s] Resource %s/%s was CREATED by %s",
 					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 				w.notifier.SendNotification(notifier.NotificationEvent{
@@ -188,7 +188,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 					Namespace:    metadata.GetNamespace(),
 					User:         user,
 				})
-			case watch.Modified:
+			case "MODIFIED":
 				log.Printf("[%s] Resource %s/%s was MODIFIED by %s",
 					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 				w.notifier.SendNotification(notifier.NotificationEvent{
@@ -198,7 +198,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 					Namespace:    metadata.GetNamespace(),
 					User:         user,
 				})
-			case watch.Deleted:
+			case "DELETED":
 				log.Printf("[%s] Resource %s/%s was DELETED by %s",
 					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 				w.notifier.SendNotification(notifier.NotificationEvent{
@@ -253,6 +253,12 @@ func getGroupVersionResource(kind string) schema.GroupVersionResource {
 			Group:    "apps",
 			Version:  "v1",
 			Resource: "deployments",
+		}
+	case "Ingress":
+		return schema.GroupVersionResource{
+			Group:    "networking.k8s.io",
+			Version:  "v1",
+			Resource: "ingresses",
 		}
 	// Add more resource types as needed
 	default:
