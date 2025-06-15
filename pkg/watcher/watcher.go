@@ -116,6 +116,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		lastSeen time.Time
 	}
 	initialResources := make(map[string]resourceInfo)
+	initialResourcesLoaded := false
 
 	// Cleanup goroutine for the initialResources map
 	go func() {
@@ -182,6 +183,9 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		listOptions.Continue = existingResources.GetContinue()
 	}
 
+	// Mark initial resources as loaded
+	initialResourcesLoaded = true
+
 	for {
 		// Create a watch for the resource with resource version
 		var watch watch.Interface
@@ -209,9 +213,19 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 
 		// Process events
 		for event := range watch.ResultChan() {
+			// Handle Status objects and other unexpected types
+			if status, ok := event.Object.(*metav1.Status); ok {
+				log.Printf("Received status event: %s", status.Status)
+				if status.Status == "Failure" {
+					log.Printf("Watch failed: %s", status.Message)
+					break
+				}
+				continue
+			}
+
 			obj, ok := event.Object.(*unstructured.Unstructured)
 			if !ok {
-				log.Printf("Error: unexpected object type: %T", event.Object)
+				log.Printf("Warning: unexpected object type: %T, skipping event", event.Object)
 				continue
 			}
 
@@ -271,7 +285,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 			// Log the event and send notification
 			switch event.Type {
 			case "ADDED":
-				if !isExisting {
+				if !isExisting && initialResourcesLoaded {
 					log.Printf("[%s] New resource %s/%s was ADDED by %s",
 						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 					w.notifier.SendNotification(notifier.NotificationEvent{
@@ -334,13 +348,16 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		// If we get here, the watch has ended
 		w.metrics.WatchReconnects++
 		if resourceConfig.ResourceName != "" {
-			log.Printf("Watch ended for %s '%s' in namespace %s, retrying in 5 seconds...",
-				resourceConfig.Kind, resourceConfig.ResourceName, resourceConfig.Namespace)
+			log.Printf("Watch ended for %s '%s' in namespace %s (reconnect #%d), retrying in 5 seconds...",
+				resourceConfig.Kind, resourceConfig.ResourceName, resourceConfig.Namespace, w.metrics.WatchReconnects)
 		} else {
-			log.Printf("Watch ended for all %s in namespace %s, retrying in 5 seconds...",
-				resourceConfig.Kind, resourceConfig.Namespace)
+			log.Printf("Watch ended for all %s in namespace %s (reconnect #%d), retrying in 5 seconds...",
+				resourceConfig.Kind, resourceConfig.Namespace, w.metrics.WatchReconnects)
 		}
-		time.Sleep(5 * time.Second)
+
+		// Add exponential backoff for reconnection attempts
+		backoffDuration := min(5*time.Second*time.Duration(w.metrics.WatchReconnects), 30*time.Second)
+		time.Sleep(backoffDuration)
 	}
 }
 

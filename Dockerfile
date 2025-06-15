@@ -1,6 +1,8 @@
 # Build stage
 FROM golang:1.21-alpine AS builder
 
+LABEL author="Abdulrahman Jimoh"
+
 WORKDIR /app
 
 RUN apk add --no-cache git
