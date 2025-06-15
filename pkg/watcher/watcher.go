@@ -355,6 +355,56 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 				resourceConfig.Kind, resourceConfig.Namespace, w.metrics.WatchReconnects)
 		}
 
+		if w.metrics.WatchReconnects > 2 {
+			log.Printf("Too many reconnects, resetting resource version and reloading initial state")
+			lastResourceVersion = ""
+			w.metrics.WatchReconnects = 0
+
+			// Reload initial resources
+			initialResources = make(map[string]resourceInfo)
+			initialResourcesLoaded = false
+
+			// List existing resources again
+			listOptions := metav1.ListOptions{
+				Limit: 500,
+			}
+			if resourceConfig.ResourceName != "" {
+				listOptions.FieldSelector = fmt.Sprintf("metadata.name=%s", resourceConfig.ResourceName)
+			}
+
+			for {
+				existingResources, err := w.client.Resource(gvr).Namespace(resourceConfig.Namespace).List(
+					context.Background(),
+					listOptions,
+				)
+				if err != nil {
+					log.Printf("Error listing existing %s in namespace %s: %v",
+						resourceConfig.Kind, resourceConfig.Namespace, err)
+					break
+				}
+
+				// Store resource versions of existing resources
+				for _, item := range existingResources.Items {
+					metadata, err := meta.Accessor(&item)
+					if err != nil {
+						continue
+					}
+					key := fmt.Sprintf("%s/%s", metadata.GetNamespace(), metadata.GetName())
+					initialResources[key] = resourceInfo{
+						version:  metadata.GetResourceVersion(),
+						lastSeen: time.Now(),
+					}
+					lastResourceVersion = metadata.GetResourceVersion()
+				}
+
+				if existingResources.GetContinue() == "" {
+					break
+				}
+				listOptions.Continue = existingResources.GetContinue()
+			}
+			initialResourcesLoaded = true
+		}
+
 		// Add exponential backoff for reconnection attempts
 		backoffDuration := min(5*time.Second*time.Duration(w.metrics.WatchReconnects), 30*time.Second)
 		time.Sleep(backoffDuration)
