@@ -134,78 +134,86 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		}
 	}()
 
-	// First, get the list of existing resources with pagination
-	var listOptions metav1.ListOptions
-	if resourceConfig.ResourceName != "" {
-		listOptions = metav1.ListOptions{
-			FieldSelector: fmt.Sprintf("metadata.name=%s", resourceConfig.ResourceName),
-			Limit:         500, // Use pagination
-		}
-	} else {
-		listOptions = metav1.ListOptions{
-			Limit: 500, // Use pagination
-		}
-	}
-
-	// Track the last resource version for reconnection
-	var lastResourceVersion string
-
-	// List existing resources with pagination
-	for {
-		existingResources, err := w.client.Resource(gvr).Namespace(resourceConfig.Namespace).List(
-			context.Background(),
-			listOptions,
-		)
-		if err != nil {
-			log.Printf("Error listing existing %s in namespace %s: %v",
-				resourceConfig.Kind, resourceConfig.Namespace, err)
-			break
+	// Function to load initial resources
+	loadInitialResources := func() (string, error) {
+		var listOptions metav1.ListOptions
+		if resourceConfig.ResourceName != "" {
+			listOptions = metav1.ListOptions{
+				FieldSelector: fmt.Sprintf("metadata.name=%s", resourceConfig.ResourceName),
+				Limit:         500,
+			}
+		} else {
+			listOptions = metav1.ListOptions{
+				Limit: 500,
+			}
 		}
 
-		// Store resource versions of existing resources
-		for _, item := range existingResources.Items {
-			metadata, err := meta.Accessor(&item)
+		var lastResourceVersion string
+
+		// List existing resources with pagination
+		for {
+			existingResources, err := w.client.Resource(gvr).Namespace(resourceConfig.Namespace).List(
+				context.Background(),
+				listOptions,
+			)
 			if err != nil {
-				continue
+				return "", fmt.Errorf("error listing existing %s in namespace %s: %v",
+					resourceConfig.Kind, resourceConfig.Namespace, err)
 			}
-			key := fmt.Sprintf("%s/%s", metadata.GetNamespace(), metadata.GetName())
-			initialResources[key] = resourceInfo{
-				version:  metadata.GetResourceVersion(),
-				lastSeen: time.Now(),
+
+			// Store resource versions of existing resources
+			for _, item := range existingResources.Items {
+				metadata, err := meta.Accessor(&item)
+				if err != nil {
+					continue
+				}
+				key := fmt.Sprintf("%s/%s", metadata.GetNamespace(), metadata.GetName())
+				initialResources[key] = resourceInfo{
+					version:  metadata.GetResourceVersion(),
+					lastSeen: time.Now(),
+				}
+				lastResourceVersion = metadata.GetResourceVersion()
 			}
-			lastResourceVersion = metadata.GetResourceVersion()
+
+			// Check if we need to continue pagination
+			if existingResources.GetContinue() == "" {
+				break
+			}
+			listOptions.Continue = existingResources.GetContinue()
 		}
 
-		// Check if we need to continue pagination
-		if existingResources.GetContinue() == "" {
-			break
-		}
-		listOptions.Continue = existingResources.GetContinue()
+		initialResourcesLoaded = true
+		return lastResourceVersion, nil
 	}
 
-	// Mark initial resources as loaded
-	initialResourcesLoaded = true
+	// Load initial resources
+	lastResourceVersion, err := loadInitialResources()
+	if err != nil {
+		log.Printf("Error loading initial resources: %v", err)
+		return
+	}
 
 	for {
 		// Create a watch for the resource with resource version
 		var watch watch.Interface
-		var err error
+		var watchErr error
 
-		watchOptions := metav1.ListOptions{
-			ResourceVersion: lastResourceVersion,
+		watchOptions := metav1.ListOptions{}
+		if lastResourceVersion != "" {
+			watchOptions.ResourceVersion = lastResourceVersion
 		}
 		if resourceConfig.ResourceName != "" {
 			watchOptions.FieldSelector = fmt.Sprintf("metadata.name=%s", resourceConfig.ResourceName)
 		}
 
-		watch, err = w.client.Resource(gvr).Namespace(resourceConfig.Namespace).Watch(
+		watch, watchErr = w.client.Resource(gvr).Namespace(resourceConfig.Namespace).Watch(
 			context.Background(),
 			watchOptions,
 		)
 
-		if err != nil {
+		if watchErr != nil {
 			log.Printf("Error watching %s in namespace %s: %v",
-				resourceConfig.Kind, resourceConfig.Namespace, err)
+				resourceConfig.Kind, resourceConfig.Namespace, watchErr)
 			w.metrics.WatchErrors++
 			time.Sleep(backoff.Step())
 			continue
@@ -218,6 +226,18 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 				log.Printf("Received status event: %s", status.Status)
 				if status.Status == "Failure" {
 					log.Printf("Watch failed: %s", status.Message)
+					// Check if it's a resource version error
+					if strings.Contains(status.Message, "too old resource version") {
+						log.Printf("Resource version too old, will reset and reload")
+						lastResourceVersion = ""
+						w.metrics.WatchReconnects = 0
+						// Reload initial resources
+						initialResources = make(map[string]resourceInfo)
+						initialResourcesLoaded = false
+						if newVersion, err := loadInitialResources(); err == nil {
+							lastResourceVersion = newVersion
+						}
+					}
 					break
 				}
 				continue
@@ -355,6 +375,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 				resourceConfig.Kind, resourceConfig.Namespace, w.metrics.WatchReconnects)
 		}
 
+		// If too many reconnects, reset the resource version
 		if w.metrics.WatchReconnects > 2 {
 			log.Printf("Too many reconnects, resetting resource version and reloading initial state")
 			lastResourceVersion = ""
@@ -364,45 +385,11 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 			initialResources = make(map[string]resourceInfo)
 			initialResourcesLoaded = false
 
-			// List existing resources again
-			listOptions := metav1.ListOptions{
-				Limit: 500,
+			if newVersion, err := loadInitialResources(); err == nil {
+				lastResourceVersion = newVersion
+			} else {
+				log.Printf("Error reloading initial resources: %v", err)
 			}
-			if resourceConfig.ResourceName != "" {
-				listOptions.FieldSelector = fmt.Sprintf("metadata.name=%s", resourceConfig.ResourceName)
-			}
-
-			for {
-				existingResources, err := w.client.Resource(gvr).Namespace(resourceConfig.Namespace).List(
-					context.Background(),
-					listOptions,
-				)
-				if err != nil {
-					log.Printf("Error listing existing %s in namespace %s: %v",
-						resourceConfig.Kind, resourceConfig.Namespace, err)
-					break
-				}
-
-				// Store resource versions of existing resources
-				for _, item := range existingResources.Items {
-					metadata, err := meta.Accessor(&item)
-					if err != nil {
-						continue
-					}
-					key := fmt.Sprintf("%s/%s", metadata.GetNamespace(), metadata.GetName())
-					initialResources[key] = resourceInfo{
-						version:  metadata.GetResourceVersion(),
-						lastSeen: time.Now(),
-					}
-					lastResourceVersion = metadata.GetResourceVersion()
-				}
-
-				if existingResources.GetContinue() == "" {
-					break
-				}
-				listOptions.Continue = existingResources.GetContinue()
-			}
-			initialResourcesLoaded = true
 		}
 
 		// Add exponential backoff for reconnection attempts
