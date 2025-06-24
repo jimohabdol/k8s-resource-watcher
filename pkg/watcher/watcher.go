@@ -32,12 +32,11 @@ type ResourceWatcher struct {
 
 // WatcherMetrics tracks watcher statistics
 type WatcherMetrics struct {
-	EventsReceived      int64
-	EventsProcessed     int64
-	EventsSkipped       int64
-	WatchErrors         int64
-	WatchReconnects     int64
-	LastResourceVersion string
+	EventsReceived  int64
+	EventsProcessed int64
+	EventsSkipped   int64
+	WatchErrors     int64
+	WatchReconnects int64
 }
 
 // ResourceEvent represents a Kubernetes resource event
@@ -49,6 +48,19 @@ type ResourceEvent struct {
 	User            string
 	Timestamp       time.Time
 	ResourceVersion string
+}
+
+// ResourceWatchState tracks the state for each resource being watched
+type ResourceWatchState struct {
+	LastResourceVersion string
+	InitialResources    map[string]resourceInfo
+	ReconnectCount      int64
+	IsInitialized       bool
+}
+
+type resourceInfo struct {
+	version  string
+	lastSeen time.Time
 }
 
 // NewResourceWatcher creates a new watcher instance
@@ -110,13 +122,11 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		Jitter:   0.1,
 	}
 
-	// Track initial resource versions with TTL
-	type resourceInfo struct {
-		version  string
-		lastSeen time.Time
+	// Initialize resource watch state
+	watchState := &ResourceWatchState{
+		InitialResources: make(map[string]resourceInfo),
+		IsInitialized:    false,
 	}
-	initialResources := make(map[string]resourceInfo)
-	initialResourcesLoaded := false
 
 	// Cleanup goroutine for the initialResources map
 	go func() {
@@ -125,10 +135,10 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 
 		for range ticker.C {
 			now := time.Now()
-			for key, info := range initialResources {
+			for key, info := range watchState.InitialResources {
 				// Remove entries older than 24 hours
 				if now.Sub(info.lastSeen) > 24*time.Hour {
-					delete(initialResources, key)
+					delete(watchState.InitialResources, key)
 				}
 			}
 		}
@@ -168,7 +178,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 					continue
 				}
 				key := fmt.Sprintf("%s/%s", metadata.GetNamespace(), metadata.GetName())
-				initialResources[key] = resourceInfo{
+				watchState.InitialResources[key] = resourceInfo{
 					version:  metadata.GetResourceVersion(),
 					lastSeen: time.Now(),
 				}
@@ -182,7 +192,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 			listOptions.Continue = existingResources.GetContinue()
 		}
 
-		initialResourcesLoaded = true
+		watchState.IsInitialized = true
 		return lastResourceVersion, nil
 	}
 
@@ -230,10 +240,10 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 					if strings.Contains(status.Message, "too old resource version") {
 						log.Printf("Resource version too old, will reset and reload")
 						lastResourceVersion = ""
-						w.metrics.WatchReconnects = 0
+						watchState.ReconnectCount = 0
 						// Reload initial resources
-						initialResources = make(map[string]resourceInfo)
-						initialResourcesLoaded = false
+						watchState.InitialResources = make(map[string]resourceInfo)
+						watchState.IsInitialized = false
 						if newVersion, err := loadInitialResources(); err == nil {
 							lastResourceVersion = newVersion
 						}
@@ -296,16 +306,15 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 
 			// Update metrics
 			w.metrics.EventsReceived++
-			w.metrics.LastResourceVersion = metadata.GetResourceVersion()
 
 			// Check if this is a new resource or an existing one
 			key := fmt.Sprintf("%s/%s", metadata.GetNamespace(), metadata.GetName())
-			_, isExisting := initialResources[key]
+			_, isExisting := watchState.InitialResources[key]
 
 			// Log the event and send notification
 			switch event.Type {
 			case "ADDED":
-				if !isExisting && initialResourcesLoaded {
+				if !isExisting && watchState.IsInitialized {
 					log.Printf("[%s] New resource %s/%s was ADDED by %s",
 						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 					w.notifier.SendNotification(notifier.NotificationEvent{
@@ -322,7 +331,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 					w.metrics.EventsSkipped++
 				}
 				// Update last seen time
-				initialResources[key] = resourceInfo{
+				watchState.InitialResources[key] = resourceInfo{
 					version:  metadata.GetResourceVersion(),
 					lastSeen: time.Now(),
 				}
@@ -338,7 +347,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 				})
 				w.metrics.EventsProcessed++
 				// Update last seen time
-				initialResources[key] = resourceInfo{
+				watchState.InitialResources[key] = resourceInfo{
 					version:  metadata.GetResourceVersion(),
 					lastSeen: time.Now(),
 				}
@@ -354,7 +363,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 				})
 				w.metrics.EventsProcessed++
 				// Remove from tracking
-				delete(initialResources, key)
+				delete(watchState.InitialResources, key)
 			default:
 				log.Printf("Skipping unknown event type: %s", event.Type)
 				w.metrics.EventsSkipped++
@@ -366,24 +375,25 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		}
 
 		// If we get here, the watch has ended
+		watchState.ReconnectCount++
 		w.metrics.WatchReconnects++
 		if resourceConfig.ResourceName != "" {
 			log.Printf("Watch ended for %s '%s' in namespace %s (reconnect #%d), retrying in 5 seconds...",
-				resourceConfig.Kind, resourceConfig.ResourceName, resourceConfig.Namespace, w.metrics.WatchReconnects)
+				resourceConfig.Kind, resourceConfig.ResourceName, resourceConfig.Namespace, watchState.ReconnectCount)
 		} else {
 			log.Printf("Watch ended for all %s in namespace %s (reconnect #%d), retrying in 5 seconds...",
-				resourceConfig.Kind, resourceConfig.Namespace, w.metrics.WatchReconnects)
+				resourceConfig.Kind, resourceConfig.Namespace, watchState.ReconnectCount)
 		}
 
 		// If too many reconnects, reset the resource version
-		if w.metrics.WatchReconnects > 2 {
+		if watchState.ReconnectCount > 2 {
 			log.Printf("Too many reconnects, resetting resource version and reloading initial state")
 			lastResourceVersion = ""
-			w.metrics.WatchReconnects = 0
+			watchState.ReconnectCount = 0
 
 			// Reload initial resources
-			initialResources = make(map[string]resourceInfo)
-			initialResourcesLoaded = false
+			watchState.InitialResources = make(map[string]resourceInfo)
+			watchState.IsInitialized = false
 
 			if newVersion, err := loadInitialResources(); err == nil {
 				lastResourceVersion = newVersion
@@ -393,7 +403,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		}
 
 		// Add exponential backoff for reconnection attempts
-		backoffDuration := min(5*time.Second*time.Duration(w.metrics.WatchReconnects), 30*time.Second)
+		backoffDuration := min(5*time.Second*time.Duration(watchState.ReconnectCount), 30*time.Second)
 		time.Sleep(backoffDuration)
 	}
 }
