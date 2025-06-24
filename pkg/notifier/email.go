@@ -75,12 +75,13 @@ Time: %s
 This is an automated notification from the Kubernetes Resource Watcher.
 `, n.config.ClusterName, event.ResourceKind, event.ResourceName, event.Namespace, event.EventType, event.User, time.Now().Format(time.RFC3339))
 
+	log.Printf("Preparing email: Subject='%s', To='%s', From='%s'",
+		subject, strings.Join(n.config.Email.ToEmails, ", "), n.config.Email.FromEmail)
+
 	m := gomail.NewMessage()
 	m.SetHeader("From", n.config.Email.FromEmail)
-	// Set each recipient individually
-	for _, to := range n.config.Email.ToEmails {
-		m.SetHeader("To", strings.TrimSpace(to))
-	}
+	// Set all recipients at once
+	m.SetHeader("To", strings.Join(n.config.Email.ToEmails, ", "))
 	m.SetHeader("Subject", subject)
 	m.SetBody("text/plain", body)
 

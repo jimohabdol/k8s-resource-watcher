@@ -208,6 +208,10 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		log.Printf("Successfully loaded initial resources, starting watch with resource version: %s", lastResourceVersion)
 	}
 
+	// Add a startup delay to avoid spam notifications
+	log.Printf("Waiting 10 seconds before starting to watch to avoid spam notifications...")
+	time.Sleep(10 * time.Second)
+
 	for {
 		// Create a watch for the resource with resource version
 		var watch watch.Interface
@@ -343,7 +347,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
 					w.metrics.EventsSkipped++
 				}
-				// Update last seen time
+				// Always update tracking to prevent future spam
 				watchState.InitialResources[key] = resourceInfo{
 					version:  metadata.GetResourceVersion(),
 					lastSeen: time.Now(),
