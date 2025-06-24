@@ -200,7 +200,12 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 	lastResourceVersion, err := loadInitialResources()
 	if err != nil {
 		log.Printf("Error loading initial resources: %v", err)
-		return
+		// Don't return, start watching anyway without resource version
+		log.Printf("Starting watch without initial resource loading")
+		lastResourceVersion = ""
+		watchState.IsInitialized = true // Mark as initialized so we don't send notifications for existing resources
+	} else {
+		log.Printf("Successfully loaded initial resources, starting watch with resource version: %s", lastResourceVersion)
 	}
 
 	for {
@@ -209,8 +214,12 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		var watchErr error
 
 		watchOptions := metav1.ListOptions{}
-		if lastResourceVersion != "" {
+		// Only use resource version if we haven't had any issues
+		if lastResourceVersion != "" && watchState.ReconnectCount == 0 {
 			watchOptions.ResourceVersion = lastResourceVersion
+			log.Printf("Starting watch with resource version: %s", lastResourceVersion)
+		} else {
+			log.Printf("Starting watch without resource version (fresh start)")
 		}
 		if resourceConfig.ResourceName != "" {
 			watchOptions.FieldSelector = fmt.Sprintf("metadata.name=%s", resourceConfig.ResourceName)
@@ -225,6 +234,11 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 			log.Printf("Error watching %s in namespace %s: %v",
 				resourceConfig.Kind, resourceConfig.Namespace, watchErr)
 			w.metrics.WatchErrors++
+			// Force reset on any watch error
+			lastResourceVersion = ""
+			watchState.ReconnectCount = 0
+			watchState.InitialResources = make(map[string]resourceInfo)
+			watchState.IsInitialized = false
 			time.Sleep(backoff.Step())
 			continue
 		}
@@ -238,15 +252,14 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 					log.Printf("Watch failed: %s", status.Message)
 					// Check if it's a resource version error
 					if strings.Contains(status.Message, "too old resource version") {
-						log.Printf("Resource version too old, will reset and reload")
+						log.Printf("Resource version too old, forcing complete reset")
+						// Force complete reset - don't use any resource version
 						lastResourceVersion = ""
 						watchState.ReconnectCount = 0
-						// Reload initial resources
 						watchState.InitialResources = make(map[string]resourceInfo)
 						watchState.IsInitialized = false
-						if newVersion, err := loadInitialResources(); err == nil {
-							lastResourceVersion = newVersion
-						}
+						// Don't try to reload initial resources - start completely fresh
+						log.Printf("Starting watch without resource version")
 					}
 					break
 				}
@@ -385,21 +398,19 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 				resourceConfig.Kind, resourceConfig.Namespace, watchState.ReconnectCount)
 		}
 
-		// If too many reconnects, reset the resource version
-		if watchState.ReconnectCount > 2 {
-			log.Printf("Too many reconnects, resetting resource version and reloading initial state")
+		// Reset resource version on any reconnect
+		if watchState.ReconnectCount > 0 {
+			log.Printf("Resetting resource version due to reconnect")
 			lastResourceVersion = ""
-			watchState.ReconnectCount = 0
-
-			// Reload initial resources
 			watchState.InitialResources = make(map[string]resourceInfo)
 			watchState.IsInitialized = false
+		}
 
-			if newVersion, err := loadInitialResources(); err == nil {
-				lastResourceVersion = newVersion
-			} else {
-				log.Printf("Error reloading initial resources: %v", err)
-			}
+		// If too many reconnects, wait longer
+		if watchState.ReconnectCount > 5 {
+			log.Printf("Too many reconnects, waiting longer before retry")
+			time.Sleep(30 * time.Second)
+			watchState.ReconnectCount = 0 // Reset counter after long wait
 		}
 
 		// Add exponential backoff for reconnection attempts
