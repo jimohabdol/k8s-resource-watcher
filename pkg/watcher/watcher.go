@@ -56,6 +56,7 @@ type ResourceWatchState struct {
 	InitialResources    map[string]resourceInfo
 	ReconnectCount      int64
 	IsInitialized       bool
+	InitializedTime     time.Time
 }
 
 type resourceInfo struct {
@@ -193,6 +194,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		}
 
 		watchState.IsInitialized = true
+		watchState.InitializedTime = time.Now()
 		return lastResourceVersion, nil
 	}
 
@@ -204,6 +206,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		log.Printf("Starting watch without initial resource loading")
 		lastResourceVersion = ""
 		watchState.IsInitialized = true // Mark as initialized so we don't send notifications for existing resources
+		watchState.InitializedTime = time.Now()
 	} else {
 		log.Printf("Successfully loaded initial resources, starting watch with resource version: %s", lastResourceVersion)
 	}
@@ -211,6 +214,25 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 	// Add a startup delay to avoid spam notifications
 	log.Printf("Waiting 10 seconds before starting to watch to avoid spam notifications...")
 	time.Sleep(10 * time.Second)
+
+	// Track processed events to prevent duplicates
+	processedEvents := make(map[string]time.Time)
+
+	// Cleanup processed events periodically
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			now := time.Now()
+			for eventKey, timestamp := range processedEvents {
+				// Remove events older than 1 hour
+				if now.Sub(timestamp) > time.Hour {
+					delete(processedEvents, eventKey)
+				}
+			}
+		}
+	}()
 
 	for {
 		// Create a watch for the resource with resource version
@@ -321,6 +343,24 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 				ResourceVersion: metadata.GetResourceVersion(),
 			}
 
+			// Create unique event key to prevent duplicates
+			eventKey := fmt.Sprintf("%s:%s:%s:%s:%s",
+				event.Type,
+				resourceConfig.Kind,
+				metadata.GetNamespace(),
+				metadata.GetName(),
+				metadata.GetResourceVersion())
+
+			// Check if we've already processed this event
+			if _, exists := processedEvents[eventKey]; exists {
+				log.Printf("Skipping duplicate event: %s", eventKey)
+				w.metrics.EventsSkipped++
+				continue
+			}
+
+			// Mark event as processed
+			processedEvents[eventKey] = time.Now()
+
 			// Update metrics
 			w.metrics.EventsReceived++
 
@@ -331,7 +371,7 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 			// Log the event and send notification
 			switch event.Type {
 			case "ADDED":
-				if !isExisting && watchState.IsInitialized {
+				if !isExisting && watchState.IsInitialized && time.Since(watchState.InitializedTime) > 30*time.Second {
 					log.Printf("[%s] New resource %s/%s was ADDED by %s",
 						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 					w.notifier.SendNotification(notifier.NotificationEvent{
