@@ -34,35 +34,26 @@ spec:
           capabilities:
             drop: ["ALL"]
         env:
-        - name: CLUSTER_NAME
+        - name: SMTP_USERNAME
           valueFrom:
-            fieldRef:
-              fieldPath: metadata.clusterName
-        - name: SMTP_HOST
+            secretKeyRef:
+              name: smtp-credentials
+              key: smtp-username
+        - name: SMTP_PASSWORD
           valueFrom:
-            configMapKeyRef:
-              name: resource-watcher-config
-              key: smtpHost
-        - name: SMTP_PORT
-          valueFrom:
-            configMapKeyRef:
-              name: resource-watcher-config
-              key: smtpPort
-        - name: SMTP_USE_AUTH
-          valueFrom:
-            configMapKeyRef:
-              name: resource-watcher-config
-              key: useAuth
+            secretKeyRef:
+              name: smtp-credentials
+              key: smtp-password
         - name: FROM_EMAIL
           valueFrom:
-            configMapKeyRef:
-              name: resource-watcher-config
-              key: fromEmail
+            secretKeyRef:
+              name: smtp-credentials
+              key: from-email
         - name: TO_EMAILS
           valueFrom:
-            configMapKeyRef:
-              name: resource-watcher-config
-              key: toEmails
+            secretKeyRef:
+              name: smtp-credentials
+              key: to-emails
         resources:
           requests:
             cpu: "100m"
@@ -77,9 +68,6 @@ spec:
         - name: config-volume
           mountPath: /app/config.yaml
           subPath: config.yaml
-          readOnly: true
-        - name: secrets-volume
-          mountPath: /etc/resource-watcher/secrets
           readOnly: true
         - name: tmp
           mountPath: /tmp
@@ -101,9 +89,6 @@ spec:
       - name: config-volume
         configMap:
           name: resource-watcher-config
-      - name: secrets-volume
-        secret:
-          secretName: smtp-credentials
       - name: tmp
         emptyDir: {}
 ---

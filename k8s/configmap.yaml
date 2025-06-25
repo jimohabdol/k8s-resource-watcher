@@ -7,6 +7,14 @@ data:
   config.yaml: |
     clusterName: "my-cluster"  # Name of your Kubernetes cluster
 
+    # Watcher configuration (optional)
+    watcher:
+      watchTimeoutSeconds: 600  # 10 minutes - how long each watch connection lasts
+      maxReconnects: 5          # Maximum reconnects before resetting state
+      reconnectBackoffMs: 5000  # Base backoff time in milliseconds
+      heartbeatIntervalMs: 30000 # 30 seconds - heartbeat interval for keep-alive
+      keepAliveEnabled: true    # Enable keep-alive functionality
+
     resources:
       # Watch all ConfigMaps in the dev namespace
       - kind: ConfigMap
@@ -30,10 +38,11 @@ data:
       smtpHost: "smtp.gmail.com"
       smtpPort: 587
       useAuth: true
-      smtpUsername: "your-email@gmail.com"
-      smtpPassword: "your-app-password"
-      fromEmail: "your-email@gmail.com"
-      toEmail: "recipient@example.com"
+      # Credentials will be loaded from environment variables (set by secretKeyRef)
+      smtpUsername: ""  # Will be overridden by SMTP_USERNAME env var
+      smtpPassword: ""  # Will be overridden by SMTP_PASSWORD env var
+      fromEmail: ""     # Will be overridden by FROM_EMAIL env var
+      toEmails: []      # Will be overridden by TO_EMAILS env var
 
     # Example with authentication enabled:
     # email:
