@@ -6,8 +6,6 @@ import (
 	"k8s-resource-watcher/pkg/config"
 	"k8s-resource-watcher/pkg/notifier"
 	"log"
-	"net"
-	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -90,20 +88,6 @@ func NewResourceWatcher(cfg *config.Config, eventHandler func(event *ResourceEve
 	k8sConfig.QPS = 100
 	k8sConfig.Burst = 200
 	k8sConfig.RateLimiter = nil // Disable rate limiting for watches
-
-	// Configure HTTP transport for keep-alive
-	if k8sConfig.Transport == nil {
-		k8sConfig.Transport = &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-			TLSHandshakeTimeout: 10 * time.Second,
-		}
-	}
 
 	client, err := dynamic.NewForConfig(k8sConfig)
 	if err != nil {
