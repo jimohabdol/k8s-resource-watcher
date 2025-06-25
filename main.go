@@ -99,6 +99,7 @@ func main() {
 		<-signalChan
 		log.Println("Received shutdown signal, stopping watchers...")
 		cancel()
+		resourceWatcher.Stop()
 
 		// Create shutdown context with timeout
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)

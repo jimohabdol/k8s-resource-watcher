@@ -6,6 +6,8 @@ import (
 	"k8s-resource-watcher/pkg/config"
 	"k8s-resource-watcher/pkg/notifier"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -28,6 +30,8 @@ type ResourceWatcher struct {
 	eventHandler func(event *ResourceEvent)
 	metrics      *WatcherMetrics
 	notifier     notifier.Notifier
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // WatcherMetrics tracks watcher statistics
@@ -57,6 +61,11 @@ type ResourceWatchState struct {
 	ReconnectCount      int64
 	IsInitialized       bool
 	InitializedTime     time.Time
+	LastSuccessfulWatch time.Time
+	ConsecutiveFailures int64
+	LastHeartbeat       time.Time
+	ConnectionHealthy   bool
+	WatchInterface      watch.Interface
 }
 
 type resourceInfo struct {
@@ -76,10 +85,32 @@ func NewResourceWatcher(cfg *config.Config, eventHandler func(event *ResourceEve
 		}
 	}
 
+	// Set reasonable timeouts and limits for the client
+	k8sConfig.Timeout = 30 * time.Second
+	k8sConfig.QPS = 100
+	k8sConfig.Burst = 200
+	k8sConfig.RateLimiter = nil // Disable rate limiting for watches
+
+	// Configure HTTP transport for keep-alive
+	if k8sConfig.Transport == nil {
+		k8sConfig.Transport = &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		}
+	}
+
 	client, err := dynamic.NewForConfig(k8sConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create dynamic client: %v", err)
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	return &ResourceWatcher{
 		client:       client,
@@ -87,18 +118,32 @@ func NewResourceWatcher(cfg *config.Config, eventHandler func(event *ResourceEve
 		eventHandler: eventHandler,
 		metrics:      &WatcherMetrics{},
 		notifier:     notifier,
+		ctx:          ctx,
+		cancel:       cancel,
 	}, nil
 }
 
 // Start begins watching the configured resources
 func (w *ResourceWatcher) Start(ctx context.Context) error {
+	// Create a context that will be cancelled when the main context is cancelled
+	watchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Start watching each resource in its own goroutine
 	for _, resource := range w.config.Resources {
-		go w.watchResource(resource)
+		go func(resourceConfig config.ResourceConfig) {
+			w.watchResource(watchCtx, resourceConfig)
+		}(resource)
 	}
 	return nil
 }
 
-func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
+// Stop gracefully stops all watchers
+func (w *ResourceWatcher) Stop() {
+	w.cancel()
+}
+
+func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig config.ResourceConfig) {
 	// Get the GVR for the resource kind
 	gvr := getGroupVersionResource(resourceConfig.Kind)
 	if gvr.Empty() {
@@ -115,18 +160,22 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 			resourceConfig.Kind, resourceConfig.Namespace)
 	}
 
-	// Create a backoff for retries
+	// Create a backoff for retries with exponential backoff
 	backoff := wait.Backoff{
-		Steps:    5,
+		Steps:    10,
 		Duration: 1 * time.Second,
 		Factor:   2.0,
 		Jitter:   0.1,
+		Cap:      5 * time.Minute,
 	}
 
 	// Initialize resource watch state
 	watchState := &ResourceWatchState{
-		InitialResources: make(map[string]resourceInfo),
-		IsInitialized:    false,
+		InitialResources:    make(map[string]resourceInfo),
+		IsInitialized:       false,
+		LastSuccessfulWatch: time.Now(),
+		LastHeartbeat:       time.Now(),
+		ConnectionHealthy:   false,
 	}
 
 	// Track when we actually start watching (after initial loading)
@@ -137,16 +186,51 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			now := time.Now()
-			for key, info := range watchState.InitialResources {
-				// Remove entries older than 24 hours
-				if now.Sub(info.lastSeen) > 24*time.Hour {
-					delete(watchState.InitialResources, key)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				now := time.Now()
+				for key, info := range watchState.InitialResources {
+					// Remove entries older than 24 hours
+					if now.Sub(info.lastSeen) > 24*time.Hour {
+						delete(watchState.InitialResources, key)
+					}
 				}
 			}
 		}
 	}()
+
+	// Keep-alive heartbeat goroutine
+	heartbeatInterval := 30 * time.Second // Default 30 seconds
+	if w.config.Watcher.HeartbeatIntervalMs > 0 {
+		heartbeatInterval = time.Duration(w.config.Watcher.HeartbeatIntervalMs) * time.Millisecond
+	}
+
+	if w.config.Watcher.KeepAliveEnabled {
+		go func() {
+			ticker := time.NewTicker(heartbeatInterval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					// Check if we have an active watch and it's been too long since last event
+					if watchState.WatchInterface != nil && watchState.ConnectionHealthy {
+						timeSinceLastHeartbeat := time.Since(watchState.LastHeartbeat)
+						if timeSinceLastHeartbeat > heartbeatInterval*3 {
+							log.Printf("Keep-alive: No events received for %v, checking connection health", timeSinceLastHeartbeat)
+							// Force a reconnection if we haven't received events for too long
+							watchState.ConnectionHealthy = false
+						}
+					}
+				}
+			}
+		}()
+	}
 
 	// Function to load initial resources
 	loadInitialResources := func() (string, error) {
@@ -166,8 +250,14 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 
 		// List existing resources with pagination
 		for {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			default:
+			}
+
 			existingResources, err := w.client.Resource(gvr).Namespace(resourceConfig.Namespace).List(
-				context.Background(),
+				ctx,
 				listOptions,
 			)
 			if err != nil {
@@ -217,7 +307,11 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 
 	// Add a startup delay to avoid spam notifications
 	log.Printf("Waiting 10 seconds before starting to watch to avoid spam notifications...")
-	time.Sleep(10 * time.Second)
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(10 * time.Second):
+	}
 
 	// Mark the actual watch start time
 	watchStartTime = time.Now()
@@ -231,54 +325,123 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			now := time.Now()
-			for eventKey, timestamp := range processedEvents {
-				// Remove events older than 1 hour
-				if now.Sub(timestamp) > time.Hour {
-					delete(processedEvents, eventKey)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				now := time.Now()
+				for eventKey, timestamp := range processedEvents {
+					// Remove events older than 1 hour
+					if now.Sub(timestamp) > time.Hour {
+						delete(processedEvents, eventKey)
+					}
 				}
 			}
 		}
 	}()
 
 	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Context cancelled, stopping watch for %s in namespace %s", resourceConfig.Kind, resourceConfig.Namespace)
+			return
+		default:
+		}
+
+		// Check if keep-alive detected a stale connection
+		if w.config.Watcher.KeepAliveEnabled && !watchState.ConnectionHealthy && watchState.WatchInterface != nil {
+			log.Printf("Keep-alive: Detected stale connection, forcing reconnection")
+			watchState.WatchInterface.Stop()
+			watchState.WatchInterface = nil
+		}
+
 		// Create a watch for the resource with resource version
 		var watch watch.Interface
 		var watchErr error
 
-		watchOptions := metav1.ListOptions{}
-		// Only use resource version if we haven't had any issues
-		if lastResourceVersion != "" && watchState.ReconnectCount == 0 {
+		// Get timeout from config or use default
+		timeoutSeconds := int64(600) // Default 10 minutes
+		if w.config.Watcher.WatchTimeoutSeconds > 0 {
+			timeoutSeconds = w.config.Watcher.WatchTimeoutSeconds
+		}
+
+		watchOptions := metav1.ListOptions{
+			// Set a reasonable timeout for the watch
+			TimeoutSeconds: &timeoutSeconds,
+		}
+
+		// Only use resource version if we haven't had too many consecutive failures
+		// and if we have a valid resource version
+		if lastResourceVersion != "" && watchState.ConsecutiveFailures < 3 && len(lastResourceVersion) > 0 {
 			watchOptions.ResourceVersion = lastResourceVersion
 			log.Printf("Starting watch with resource version: %s", lastResourceVersion)
 		} else {
 			log.Printf("Starting watch without resource version (fresh start)")
 		}
+
 		if resourceConfig.ResourceName != "" {
 			watchOptions.FieldSelector = fmt.Sprintf("metadata.name=%s", resourceConfig.ResourceName)
 		}
 
+		// Create a context with timeout for the watch (slightly longer than watch timeout)
+		watchCtx, watchCancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds+60)*time.Second)
 		watch, watchErr = w.client.Resource(gvr).Namespace(resourceConfig.Namespace).Watch(
-			context.Background(),
+			watchCtx,
 			watchOptions,
 		)
+		watchCancel()
 
 		if watchErr != nil {
 			log.Printf("Error watching %s in namespace %s: %v",
 				resourceConfig.Kind, resourceConfig.Namespace, watchErr)
 			w.metrics.WatchErrors++
-			// Force reset on any watch error
-			lastResourceVersion = ""
-			watchState.ReconnectCount = 0
-			watchState.InitialResources = make(map[string]resourceInfo)
-			watchState.IsInitialized = false
-			time.Sleep(backoff.Step())
+			watchState.ConsecutiveFailures++
+			watchState.ConnectionHealthy = false
+
+			// Check if it's a network-related error
+			if strings.Contains(watchErr.Error(), "connection refused") ||
+				strings.Contains(watchErr.Error(), "timeout") ||
+				strings.Contains(watchErr.Error(), "network") {
+				log.Printf("Network-related error detected, will retry with backoff")
+			}
+
+			// Only reset everything if we've had multiple consecutive failures
+			if watchState.ConsecutiveFailures >= 3 {
+				log.Printf("Multiple consecutive failures, forcing complete reset")
+				lastResourceVersion = ""
+				watchState.ReconnectCount = 0
+				watchState.InitialResources = make(map[string]resourceInfo)
+				watchState.IsInitialized = false
+				watchState.ConsecutiveFailures = 0
+			}
+
+			// Use exponential backoff
+			backoffDuration := backoff.Step()
+			log.Printf("Retrying in %v...", backoffDuration)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoffDuration):
+			}
 			continue
 		}
 
+		// Reset consecutive failures on successful watch creation
+		watchState.ConsecutiveFailures = 0
+		watchState.LastSuccessfulWatch = time.Now()
+		watchState.ConnectionHealthy = true
+		watchState.WatchInterface = watch
+		watchState.LastHeartbeat = time.Now()
+
+		log.Printf("Keep-alive: Watch connection established successfully")
+
 		// Process events
 		for event := range watch.ResultChan() {
+			// Update heartbeat on any event
+			watchState.LastHeartbeat = time.Now()
+			watchState.ConnectionHealthy = true
+
 			// Handle Status objects and other unexpected types
 			if status, ok := event.Object.(*metav1.Status); ok {
 				log.Printf("Received status event: %s", status.Status)
@@ -292,6 +455,8 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 						watchState.ReconnectCount = 0
 						watchState.InitialResources = make(map[string]resourceInfo)
 						watchState.IsInitialized = false
+						watchState.ConsecutiveFailures = 0
+						watchState.ConnectionHealthy = false
 						// Don't try to reload initial resources - start completely fresh
 						log.Printf("Starting watch without resource version")
 					}
@@ -518,35 +683,66 @@ func (w *ResourceWatcher) watchResource(resourceConfig config.ResourceConfig) {
 		// If we get here, the watch has ended
 		watchState.ReconnectCount++
 		w.metrics.WatchReconnects++
+		watchState.ConnectionHealthy = false
+		watchState.WatchInterface = nil
+
+		// Log detailed information about the reconnect
+		timeSinceLastSuccess := time.Since(watchState.LastSuccessfulWatch)
+		timeSinceLastHeartbeat := time.Since(watchState.LastHeartbeat)
 		if resourceConfig.ResourceName != "" {
-			log.Printf("Watch ended for %s '%s' in namespace %s (reconnect #%d), retrying in 5 seconds...",
-				resourceConfig.Kind, resourceConfig.ResourceName, resourceConfig.Namespace, watchState.ReconnectCount)
+			log.Printf("Watch ended for %s '%s' in namespace %s (reconnect #%d, last success: %v ago, last heartbeat: %v ago), retrying...",
+				resourceConfig.Kind, resourceConfig.ResourceName, resourceConfig.Namespace, watchState.ReconnectCount, timeSinceLastSuccess, timeSinceLastHeartbeat)
 		} else {
-			log.Printf("Watch ended for all %s in namespace %s (reconnect #%d), retrying in 5 seconds...",
-				resourceConfig.Kind, resourceConfig.Namespace, watchState.ReconnectCount)
+			log.Printf("Watch ended for all %s in namespace %s (reconnect #%d, last success: %v ago, last heartbeat: %v ago), retrying...",
+				resourceConfig.Kind, resourceConfig.Namespace, watchState.ReconnectCount, timeSinceLastSuccess, timeSinceLastHeartbeat)
 		}
 
-		// Reset resource version on any reconnect
-		if watchState.ReconnectCount > 0 {
-			log.Printf("Resetting resource version due to reconnect")
+		// Only reset resource version on reconnects if we've had too many failures
+		// This helps maintain continuity and reduces missed events
+		maxReconnects := int64(5) // Default
+		if w.config.Watcher.MaxReconnects > 0 {
+			maxReconnects = w.config.Watcher.MaxReconnects
+		}
+
+		if watchState.ReconnectCount > maxReconnects {
+			log.Printf("Too many reconnects, resetting resource version and clearing state")
 			lastResourceVersion = ""
 			watchState.InitialResources = make(map[string]resourceInfo)
 			watchState.IsInitialized = false
+			watchState.ReconnectCount = 0
+			watchState.ConnectionHealthy = false
 			// Clear processed events to prevent issues with stale tracking
+			processedEvents = make(map[string]time.Time)
+			log.Printf("Cleared processed events due to excessive reconnects")
+		} else if watchState.ReconnectCount > 2 {
+			// For moderate reconnects, just clear processed events but keep resource version
 			processedEvents = make(map[string]time.Time)
 			log.Printf("Cleared processed events due to reconnect")
 		}
 
 		// If too many reconnects, wait longer
-		if watchState.ReconnectCount > 5 {
+		if watchState.ReconnectCount > maxReconnects {
 			log.Printf("Too many reconnects, waiting longer before retry")
-			time.Sleep(30 * time.Second)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
+			}
 			watchState.ReconnectCount = 0 // Reset counter after long wait
 		}
 
 		// Add exponential backoff for reconnection attempts
-		backoffDuration := min(5*time.Second*time.Duration(watchState.ReconnectCount), 30*time.Second)
-		time.Sleep(backoffDuration)
+		baseBackoff := 5 * time.Second
+		if w.config.Watcher.ReconnectBackoffMs > 0 {
+			baseBackoff = time.Duration(w.config.Watcher.ReconnectBackoffMs) * time.Millisecond
+		}
+		backoffDuration := min(baseBackoff*time.Duration(watchState.ReconnectCount), 30*time.Second)
+		log.Printf("Waiting %v before next reconnect attempt...", backoffDuration)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoffDuration):
+		}
 	}
 }
 

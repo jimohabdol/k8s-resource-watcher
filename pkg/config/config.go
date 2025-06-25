@@ -11,6 +11,16 @@ type Config struct {
 	ClusterName string           `yaml:"clusterName"`
 	Resources   []ResourceConfig `yaml:"resources"`
 	Email       EmailConfig      `yaml:"email"`
+	Watcher     WatcherConfig    `yaml:"watcher,omitempty"`
+}
+
+// WatcherConfig represents configuration for the watcher behavior
+type WatcherConfig struct {
+	WatchTimeoutSeconds int64 `yaml:"watchTimeoutSeconds,omitempty"`
+	MaxReconnects       int64 `yaml:"maxReconnects,omitempty"`
+	ReconnectBackoffMs  int64 `yaml:"reconnectBackoffMs,omitempty"`
+	HeartbeatIntervalMs int64 `yaml:"heartbeatIntervalMs,omitempty"`
+	KeepAliveEnabled    bool  `yaml:"keepAliveEnabled,omitempty"`
 }
 
 // ResourceConfig represents configuration for a single resource type

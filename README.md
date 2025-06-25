@@ -89,6 +89,12 @@ email:
   - `kind`: Type of resource (ConfigMap, Secret, Deployment)
   - `namespace`: Namespace to watch
   - `resourceName`: (Optional) Specific resource to watch. If not specified, watches all resources of the kind in the namespace
+- `watcher`: (Optional) Watcher behavior configuration
+  - `watchTimeoutSeconds`: How long each watch connection lasts (default: 600 seconds)
+  - `maxReconnects`: Maximum reconnects before resetting state (default: 5)
+  - `reconnectBackoffMs`: Base backoff time in milliseconds (default: 5000)
+  - `heartbeatIntervalMs`: Heartbeat interval for keep-alive (default: 30000 ms)
+  - `keepAliveEnabled`: Enable keep-alive functionality (default: true)
 - `email`: SMTP configuration
   - `smtpHost`: SMTP server hostname
   - `smtpPort`: SMTP server port
@@ -208,6 +214,42 @@ export TO_EMAILS="recipient1@example.com,recipient2@example.com,team@example.com
    - Check pod logs for connection errors
    - Verify network connectivity to Kubernetes API
    - Check RBAC permissions
+
+4. **Frequent reconnections**
+   - The watcher now includes improved reconnection handling
+   - Check if the issue is related to network connectivity
+   - Consider adjusting `watchTimeoutSeconds` in the watcher configuration
+   - Monitor logs for specific error patterns
+
+### Reconnection Improvements
+
+The watcher has been improved to handle reconnection issues more gracefully:
+
+- **Intelligent Resource Version Management**: The watcher now maintains resource versions more intelligently to avoid missing events during reconnections
+- **Exponential Backoff**: Implements exponential backoff for reconnection attempts to avoid overwhelming the API server
+- **Configurable Timeouts**: Watch timeouts can be configured to match your cluster's requirements
+- **Better Error Handling**: Improved detection and handling of network-related errors
+- **Context-Aware Shutdown**: Proper graceful shutdown handling to prevent resource leaks
+- **Keep-Alive Support**: HTTP keep-alive headers and heartbeat monitoring to maintain persistent connections
+- **Connection Health Monitoring**: Automatic detection and recovery from stale connections
+
+### Performance Tuning
+
+You can tune the watcher performance by adjusting the configuration:
+
+```yaml
+watcher:
+  watchTimeoutSeconds: 600  # Increase for more stable connections
+  maxReconnects: 5          # Adjust based on your cluster stability
+  reconnectBackoffMs: 5000  # Increase for less aggressive reconnection
+  heartbeatIntervalMs: 30000 # Decrease for more frequent health checks
+  keepAliveEnabled: true    # Enable to maintain persistent connections
+```
+
+**Keep-Alive Configuration Tips:**
+- **heartbeatIntervalMs**: Set to 30-60 seconds for most environments
+- **keepAliveEnabled**: Enable for environments with network instability
+- **watchTimeoutSeconds**: Use longer timeouts (10-15 minutes) with keep-alive enabled
 
 ### Checking Logs
 

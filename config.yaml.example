@@ -10,6 +10,14 @@ resources:
   # - kind: "Deployment"
   #   namespace: "apps"
 
+# Watcher configuration (optional)
+watcher:
+  watchTimeoutSeconds: 900    # 15 minutes - longer for production
+  maxReconnects: 3            # Fewer reconnects with keep-alive
+  reconnectBackoffMs: 3000    # Faster reconnection
+  heartbeatIntervalMs: 60000  # 1 minute - less frequent
+  keepAliveEnabled: true     # Enable keep-alive functionality
+
 # Email configuration
 # These values can be overridden using environment variables or Kubernetes secrets
 email:
