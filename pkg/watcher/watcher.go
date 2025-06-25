@@ -208,7 +208,13 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 		heartbeatInterval = time.Duration(w.config.Watcher.HeartbeatIntervalMs) * time.Millisecond
 	}
 
+	// Safe access to keep-alive setting with default
+	keepAliveEnabled := true // Default to true
 	if w.config.Watcher.KeepAliveEnabled {
+		keepAliveEnabled = w.config.Watcher.KeepAliveEnabled
+	}
+
+	if keepAliveEnabled {
 		go func() {
 			ticker := time.NewTicker(heartbeatInterval)
 			defer ticker.Stop()
@@ -350,7 +356,7 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 		}
 
 		// Check if keep-alive detected a stale connection
-		if w.config.Watcher.KeepAliveEnabled && !watchState.ConnectionHealthy && watchState.WatchInterface != nil {
+		if keepAliveEnabled && !watchState.ConnectionHealthy && watchState.WatchInterface != nil {
 			log.Printf("Keep-alive: Detected stale connection, forcing reconnection")
 			watchState.WatchInterface.Stop()
 			watchState.WatchInterface = nil
