@@ -1,0 +1,25 @@
+clusterName: "test-cluster"
+
+# Watcher configuration (optional)
+watcher:
+  watchTimeoutSeconds: 60   # 1 minute for testing
+  maxReconnects: 3          # Maximum reconnects before resetting state
+  reconnectBackoffMs: 2000  # Base backoff time in milliseconds
+  heartbeatIntervalMs: 15000 # 15 seconds - heartbeat interval for keep-alive
+  keepAliveEnabled: true    # Enable keep-alive functionality
+
+resources:
+  # Watch all ConfigMaps in the default namespace
+  - kind: ConfigMap
+    namespace: default
+  
+  # Watch all Secrets in the default namespace
+  - kind: Secret
+    namespace: default
+
+email:
+  smtpHost: "localhost"
+  smtpPort: 1025  # Test SMTP port
+  useAuth: false
+  fromEmail: "test@example.com"
+  toEmails: ["test@example.com"] 

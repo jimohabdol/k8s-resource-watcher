@@ -111,8 +111,11 @@ func main() {
 		}
 	}()
 
-	// Start watching resources
-	if err := resourceWatcher.Start(ctx); err != nil {
+	// Start watching resources with a timeout context
+	startCtx, startCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer startCancel()
+
+	if err := resourceWatcher.Start(startCtx); err != nil {
 		log.Fatalf("Error starting resource watcher: %v", err)
 	}
 
@@ -121,6 +124,7 @@ func main() {
 	log.Printf("Resource watcher started successfully on cluster '%s' with email notifications to %s",
 		cfg.ClusterName, strings.Join(cfg.Email.ToEmails, ", "))
 
+	// Wait for context cancellation
 	<-ctx.Done()
 	// Mark application as not ready during shutdown
 	healthHandler.SetReady(false)

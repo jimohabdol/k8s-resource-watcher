@@ -119,6 +119,15 @@ func (w *ResourceWatcher) Start(ctx context.Context) error {
 			w.watchResource(watchCtx, resourceConfig)
 		}(resource)
 	}
+
+	// Wait a moment to ensure all goroutines have started
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(100 * time.Millisecond):
+		// All goroutines should have started by now
+	}
+
 	return nil
 }
 
@@ -173,6 +182,8 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 		for {
 			select {
 			case <-ctx.Done():
+				log.Printf("Cleanup goroutine exiting due to context cancellation for %s in namespace %s",
+					resourceConfig.Kind, resourceConfig.Namespace)
 				return
 			case <-ticker.C:
 				now := time.Now()
@@ -206,6 +217,8 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 			for {
 				select {
 				case <-ctx.Done():
+					log.Printf("Keep-alive goroutine exiting due to context cancellation for %s in namespace %s",
+						resourceConfig.Kind, resourceConfig.Namespace)
 					return
 				case <-ticker.C:
 					// Check if we have an active watch and it's been too long since last event
@@ -242,14 +255,18 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 		for {
 			select {
 			case <-ctx.Done():
-				return "", ctx.Err()
+				return "", fmt.Errorf("context cancelled during initial resource loading: %v", ctx.Err())
 			default:
 			}
 
+			// Create a timeout context for the list operation
+			listCtx, listCancel := context.WithTimeout(ctx, 30*time.Second)
 			existingResources, err := w.client.Resource(gvr).Namespace(resourceConfig.Namespace).List(
-				ctx,
+				listCtx,
 				listOptions,
 			)
+			listCancel()
+
 			if err != nil {
 				return "", fmt.Errorf("error listing existing %s in namespace %s: %v",
 					resourceConfig.Kind, resourceConfig.Namespace, err)
@@ -296,11 +313,18 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 	}
 
 	// Add a startup delay to avoid spam notifications
+	// Use a more responsive approach that checks context cancellation
 	log.Printf("Waiting 10 seconds before starting to watch to avoid spam notifications...")
+	startupDelay := 10 * time.Second
+	startupTimer := time.NewTimer(startupDelay)
+	defer startupTimer.Stop()
+
 	select {
 	case <-ctx.Done():
+		log.Printf("Context cancelled during startup delay, stopping watch for %s in namespace %s", resourceConfig.Kind, resourceConfig.Namespace)
 		return
-	case <-time.After(10 * time.Second):
+	case <-startupTimer.C:
+		// Continue with normal operation
 	}
 
 	// Mark the actual watch start time
@@ -318,6 +342,8 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 		for {
 			select {
 			case <-ctx.Done():
+				log.Printf("Processed events cleanup goroutine exiting due to context cancellation for %s in namespace %s",
+					resourceConfig.Kind, resourceConfig.Namespace)
 				return
 			case <-ticker.C:
 				now := time.Now()
@@ -396,6 +422,13 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 				log.Printf("Network-related error detected, will retry with backoff")
 			}
 
+			// Check if context was cancelled
+			if ctx.Err() != nil {
+				log.Printf("Context cancelled during watch creation, stopping watch for %s in namespace %s",
+					resourceConfig.Kind, resourceConfig.Namespace)
+				return
+			}
+
 			// Only reset everything if we've had multiple consecutive failures
 			if watchState.ConsecutiveFailures >= 3 {
 				log.Printf("Multiple consecutive failures, forcing complete reset")
@@ -411,6 +444,8 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 			log.Printf("Retrying in %v...", backoffDuration)
 			select {
 			case <-ctx.Done():
+				log.Printf("Context cancelled during backoff, stopping watch for %s in namespace %s",
+					resourceConfig.Kind, resourceConfig.Namespace)
 				return
 			case <-time.After(backoffDuration):
 			}
@@ -428,6 +463,15 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 
 		// Process events
 		for event := range watch.ResultChan() {
+			// Check for context cancellation before processing each event
+			select {
+			case <-ctx.Done():
+				log.Printf("Context cancelled during event processing, stopping watch for %s in namespace %s",
+					resourceConfig.Kind, resourceConfig.Namespace)
+				return
+			default:
+			}
+
 			// Update heartbeat on any event
 			watchState.LastHeartbeat = time.Now()
 			watchState.ConnectionHealthy = true
@@ -674,7 +718,12 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 		watchState.ReconnectCount++
 		w.metrics.WatchReconnects++
 		watchState.ConnectionHealthy = false
-		watchState.WatchInterface = nil
+
+		// Ensure the watch interface is properly closed
+		if watchState.WatchInterface != nil {
+			watchState.WatchInterface.Stop()
+			watchState.WatchInterface = nil
+		}
 
 		// Log detailed information about the reconnect
 		timeSinceLastSuccess := time.Since(watchState.LastSuccessfulWatch)
@@ -715,6 +764,8 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 			log.Printf("Too many reconnects, waiting longer before retry")
 			select {
 			case <-ctx.Done():
+				log.Printf("Context cancelled during long reconnect wait, stopping watch for %s in namespace %s",
+					resourceConfig.Kind, resourceConfig.Namespace)
 				return
 			case <-time.After(30 * time.Second):
 			}
@@ -730,6 +781,8 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 		log.Printf("Waiting %v before next reconnect attempt...", backoffDuration)
 		select {
 		case <-ctx.Done():
+			log.Printf("Context cancelled during reconnection backoff, stopping watch for %s in namespace %s",
+				resourceConfig.Kind, resourceConfig.Namespace)
 			return
 		case <-time.After(backoffDuration):
 		}
