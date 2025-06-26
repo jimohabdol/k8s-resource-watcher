@@ -112,15 +112,12 @@ func NewResourceWatcher(cfg *config.Config, eventHandler func(event *ResourceEve
 }
 
 // Start begins watching the configured resources
-func (w *ResourceWatcher) Start(ctx context.Context) error {
-	// Create a context that will be cancelled when the main context is cancelled
-	watchCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
+func (w *ResourceWatcher) Start(startupCtx context.Context) error {
 	// Start watching each resource in its own goroutine
+	// Use the main context (w.ctx) for runtime operations, not the startup context
 	for _, resource := range w.config.Resources {
 		go func(resourceConfig config.ResourceConfig) {
-			w.watchResource(watchCtx, resourceConfig)
+			w.watchResource(w.ctx, resourceConfig, startupCtx)
 		}(resource)
 	}
 
@@ -160,7 +157,7 @@ func (w *ResourceWatcher) GetWatcherState() map[string]*ResourceWatchState {
 	return state
 }
 
-func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig config.ResourceConfig) {
+func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig config.ResourceConfig, startupCtx context.Context) {
 	// Create a unique key for this watcher
 	watcherKey := fmt.Sprintf("%s/%s/%s", resourceConfig.Kind, resourceConfig.Namespace, resourceConfig.ResourceName)
 
@@ -178,15 +175,6 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 	} else {
 		log.Printf("Starting to watch all %s in namespace %s",
 			resourceConfig.Kind, resourceConfig.Namespace)
-	}
-
-	// Create a backoff for retries with exponential backoff
-	backoff := wait.Backoff{
-		Steps:    10,
-		Duration: 1 * time.Second,
-		Factor:   2.0,
-		Jitter:   0.1,
-		Cap:      5 * time.Minute,
 	}
 
 	// Initialize resource watch state
@@ -214,32 +202,183 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 		log.Printf("Cleaned up watcher for %s", watcherKey)
 	}()
 
-	// Track when we actually start watching (after initial loading)
-	watchStartTime := time.Time{}
+	// CRITICAL: Load initial resources with retry logic
+	// This must succeed before starting the watch to ensure event continuity
+	lastResourceVersion, err := w.loadInitialResourcesWithRetry(startupCtx, resourceConfig, gvr, watchState)
+	if err != nil {
+		log.Printf("Failed to load initial resources for %s in namespace %s after retries: %v",
+			resourceConfig.Kind, resourceConfig.Namespace, err)
+		return
+	}
 
-	// Cleanup goroutine for the initialResources map
+	// Mark as initialized and set the watch start time
+	watchState.IsInitialized = true
+	watchState.InitializedTime = time.Now()
+	watchStartTime := time.Now()
+
+	log.Printf("Successfully loaded %d existing %s resources, starting watch with resource version: %s",
+		len(watchState.InitialResources), resourceConfig.Kind, lastResourceVersion)
+
+	// Start background goroutines for cleanup and keep-alive
+	w.startBackgroundGoroutines(ctx, resourceConfig, watchState)
+
+	// Add a startup delay to avoid spam notifications
+	log.Printf("Waiting 10 seconds before starting to watch to avoid spam notifications...")
+	startupDelay := 10 * time.Second
+	startupTimer := time.NewTimer(startupDelay)
+	defer startupTimer.Stop()
+
+	select {
+	case <-startupCtx.Done():
+		log.Printf("Startup context cancelled during startup delay, stopping watch for %s in namespace %s",
+			resourceConfig.Kind, resourceConfig.Namespace)
+		return
+	case <-ctx.Done():
+		log.Printf("Runtime context cancelled during startup delay, stopping watch for %s in namespace %s",
+			resourceConfig.Kind, resourceConfig.Namespace)
+		return
+	case <-startupTimer.C:
+		// Continue with normal operation
+	}
+
+	// Mark the actual watch start time
+	log.Printf("Starting watch at: %s", watchStartTime.Format(time.RFC3339))
+
+	// Track processed events to prevent duplicates
+	processedEvents := make(map[string]time.Time)
+
+	// Cleanup processed events periodically
 	go func() {
-		ticker := time.NewTicker(1 * time.Hour)
+		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
-				log.Printf("Cleanup goroutine exiting due to context cancellation for %s in namespace %s",
+				log.Printf("Processed events cleanup goroutine exiting due to context cancellation for %s in namespace %s",
 					resourceConfig.Kind, resourceConfig.Namespace)
 				return
 			case <-ticker.C:
 				now := time.Now()
-				for key, info := range watchState.InitialResources {
-					// Remove entries older than 24 hours
-					if now.Sub(info.lastSeen) > 24*time.Hour {
-						delete(watchState.InitialResources, key)
+				for eventKey, timestamp := range processedEvents {
+					// Remove events older than 1 hour
+					if now.Sub(timestamp) > time.Hour {
+						delete(processedEvents, eventKey)
 					}
 				}
 			}
 		}
 	}()
 
+	// Main watch loop
+	w.runWatchLoop(ctx, resourceConfig, gvr, watchState, lastResourceVersion, processedEvents, watchStartTime)
+}
+
+func (w *ResourceWatcher) loadInitialResourcesWithRetry(ctx context.Context, resourceConfig config.ResourceConfig, gvr schema.GroupVersionResource, watchState *ResourceWatchState) (string, error) {
+	// Create a backoff for retries with exponential backoff
+	backoff := wait.Backoff{
+		Steps:    10,
+		Duration: 1 * time.Second,
+		Factor:   2.0,
+		Jitter:   0.1,
+		Cap:      5 * time.Minute,
+	}
+
+	// Load initial resources with retry logic
+	var lastResourceVersion string
+	var err error
+
+	for attempt := 1; attempt <= backoff.Steps; attempt++ {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("context cancelled during initial resource loading: %v", ctx.Err())
+		default:
+		}
+
+		lastResourceVersion, err = w.loadInitialResources(ctx, resourceConfig, gvr, watchState)
+		if err == nil {
+			// Success
+			return lastResourceVersion, nil
+		}
+
+		log.Printf("Error loading initial resources (attempt %d/%d): %v", attempt, backoff.Steps, err)
+
+		if attempt < backoff.Steps {
+			// Wait before retrying
+			backoffDuration := backoff.Step()
+			log.Printf("Retrying initial resource loading in %v...", backoffDuration)
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("context cancelled during retry: %v", ctx.Err())
+			case <-time.After(backoffDuration):
+			}
+		}
+	}
+
+	return "", fmt.Errorf("failed to load initial resources after %d attempts: %v", backoff.Steps, err)
+}
+
+func (w *ResourceWatcher) loadInitialResources(ctx context.Context, resourceConfig config.ResourceConfig, gvr schema.GroupVersionResource, watchState *ResourceWatchState) (string, error) {
+	var listOptions metav1.ListOptions
+	if resourceConfig.ResourceName != "" {
+		listOptions = metav1.ListOptions{
+			FieldSelector: fmt.Sprintf("metadata.name=%s", resourceConfig.ResourceName),
+			Limit:         500,
+		}
+	} else {
+		listOptions = metav1.ListOptions{
+			Limit: 500,
+		}
+	}
+
+	var lastResourceVersion string
+
+	// List existing resources with pagination
+	for {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("context cancelled during initial resource loading: %v", ctx.Err())
+		default:
+		}
+
+		// Create a timeout context for the list operation
+		listCtx, listCancel := context.WithTimeout(ctx, 30*time.Second)
+		existingResources, err := w.client.Resource(gvr).Namespace(resourceConfig.Namespace).List(
+			listCtx,
+			listOptions,
+		)
+		listCancel()
+
+		if err != nil {
+			return "", fmt.Errorf("error listing existing %s in namespace %s: %v",
+				resourceConfig.Kind, resourceConfig.Namespace, err)
+		}
+
+		// Store resource versions of existing resources
+		for _, item := range existingResources.Items {
+			metadata, err := meta.Accessor(&item)
+			if err != nil {
+				continue
+			}
+			key := fmt.Sprintf("%s/%s", metadata.GetNamespace(), metadata.GetName())
+			watchState.InitialResources[key] = resourceInfo{
+				version:  metadata.GetResourceVersion(),
+				lastSeen: time.Now(),
+			}
+			lastResourceVersion = metadata.GetResourceVersion()
+		}
+
+		// Check if we need to continue pagination
+		if existingResources.GetContinue() == "" {
+			break
+		}
+		listOptions.Continue = existingResources.GetContinue()
+	}
+
+	return lastResourceVersion, nil
+}
+
+func (w *ResourceWatcher) startBackgroundGoroutines(ctx context.Context, resourceConfig config.ResourceConfig, watchState *ResourceWatchState) {
 	// Keep-alive heartbeat goroutine
 	heartbeatInterval := 30 * time.Second // Default 30 seconds
 	if w.config.Watcher.HeartbeatIntervalMs > 0 {
@@ -278,127 +417,39 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 		}()
 	}
 
-	// Function to load initial resources
-	loadInitialResources := func() (string, error) {
-		var listOptions metav1.ListOptions
-		if resourceConfig.ResourceName != "" {
-			listOptions = metav1.ListOptions{
-				FieldSelector: fmt.Sprintf("metadata.name=%s", resourceConfig.ResourceName),
-				Limit:         500,
-			}
-		} else {
-			listOptions = metav1.ListOptions{
-				Limit: 500,
-			}
-		}
-
-		var lastResourceVersion string
-
-		// List existing resources with pagination
-		for {
-			select {
-			case <-ctx.Done():
-				return "", fmt.Errorf("context cancelled during initial resource loading: %v", ctx.Err())
-			default:
-			}
-
-			// Create a timeout context for the list operation
-			listCtx, listCancel := context.WithTimeout(ctx, 30*time.Second)
-			existingResources, err := w.client.Resource(gvr).Namespace(resourceConfig.Namespace).List(
-				listCtx,
-				listOptions,
-			)
-			listCancel()
-
-			if err != nil {
-				return "", fmt.Errorf("error listing existing %s in namespace %s: %v",
-					resourceConfig.Kind, resourceConfig.Namespace, err)
-			}
-
-			// Store resource versions of existing resources
-			for _, item := range existingResources.Items {
-				metadata, err := meta.Accessor(&item)
-				if err != nil {
-					continue
-				}
-				key := fmt.Sprintf("%s/%s", metadata.GetNamespace(), metadata.GetName())
-				watchState.InitialResources[key] = resourceInfo{
-					version:  metadata.GetResourceVersion(),
-					lastSeen: time.Now(),
-				}
-				lastResourceVersion = metadata.GetResourceVersion()
-			}
-
-			// Check if we need to continue pagination
-			if existingResources.GetContinue() == "" {
-				break
-			}
-			listOptions.Continue = existingResources.GetContinue()
-		}
-
-		watchState.IsInitialized = true
-		watchState.InitializedTime = time.Now()
-		log.Printf("Loaded %d existing %s resources", len(watchState.InitialResources), resourceConfig.Kind)
-		return lastResourceVersion, nil
-	}
-
-	// Load initial resources
-	lastResourceVersion, err := loadInitialResources()
-	if err != nil {
-		log.Printf("Error loading initial resources: %v", err)
-		// Don't return, start watching anyway without resource version
-		log.Printf("Starting watch without initial resource loading")
-		lastResourceVersion = ""
-		watchState.IsInitialized = true // Mark as initialized so we don't send notifications for existing resources
-		watchState.InitializedTime = time.Now()
-	} else {
-		log.Printf("Successfully loaded initial resources, starting watch with resource version: %s", lastResourceVersion)
-	}
-
-	// Add a startup delay to avoid spam notifications
-	// Use a more responsive approach that checks context cancellation
-	log.Printf("Waiting 10 seconds before starting to watch to avoid spam notifications...")
-	startupDelay := 10 * time.Second
-	startupTimer := time.NewTimer(startupDelay)
-	defer startupTimer.Stop()
-
-	select {
-	case <-ctx.Done():
-		log.Printf("Context cancelled during startup delay, stopping watch for %s in namespace %s", resourceConfig.Kind, resourceConfig.Namespace)
-		return
-	case <-startupTimer.C:
-		// Continue with normal operation
-	}
-
-	// Mark the actual watch start time
-	watchStartTime = time.Now()
-	log.Printf("Starting watch at: %s", watchStartTime.Format(time.RFC3339))
-
-	// Track processed events to prevent duplicates
-	processedEvents := make(map[string]time.Time)
-
-	// Cleanup processed events periodically
+	// Cleanup goroutine for the initialResources map
 	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
+		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
 
 		for {
 			select {
 			case <-ctx.Done():
-				log.Printf("Processed events cleanup goroutine exiting due to context cancellation for %s in namespace %s",
+				log.Printf("Cleanup goroutine exiting due to context cancellation for %s in namespace %s",
 					resourceConfig.Kind, resourceConfig.Namespace)
 				return
 			case <-ticker.C:
 				now := time.Now()
-				for eventKey, timestamp := range processedEvents {
-					// Remove events older than 1 hour
-					if now.Sub(timestamp) > time.Hour {
-						delete(processedEvents, eventKey)
+				for key, info := range watchState.InitialResources {
+					// Remove entries older than 24 hours
+					if now.Sub(info.lastSeen) > 24*time.Hour {
+						delete(watchState.InitialResources, key)
 					}
 				}
 			}
 		}
 	}()
+}
+
+func (w *ResourceWatcher) runWatchLoop(ctx context.Context, resourceConfig config.ResourceConfig, gvr schema.GroupVersionResource, watchState *ResourceWatchState, lastResourceVersion string, processedEvents map[string]time.Time, watchStartTime time.Time) {
+	// Create a backoff for retries with exponential backoff
+	backoff := wait.Backoff{
+		Steps:    10,
+		Duration: 1 * time.Second,
+		Factor:   2.0,
+		Jitter:   0.1,
+		Cap:      5 * time.Minute,
+	}
 
 	for {
 		select {
@@ -409,7 +460,7 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 		}
 
 		// Check if keep-alive detected a stale connection
-		if keepAliveEnabled && !watchState.ConnectionHealthy && watchState.WatchInterface != nil {
+		if watchState.WatchInterface != nil && !watchState.ConnectionHealthy {
 			log.Printf("Keep-alive: Detected stale connection, forcing reconnection")
 			watchState.WatchInterface.Stop()
 			watchState.WatchInterface = nil

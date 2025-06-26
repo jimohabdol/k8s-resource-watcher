@@ -117,20 +117,21 @@ func main() {
 		}
 	}()
 
-	// Start watching resources with startup timeout
-	startCtx, startCancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer startCancel()
+	// Start watching resources with proper startup sequence
+	// Use a separate startup context with longer timeout for initial resource loading
+	startupCtx, startupCancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer startupCancel()
 
-	if err := resourceWatcher.Start(startCtx); err != nil {
+	if err := resourceWatcher.Start(startupCtx); err != nil {
 		log.Fatalf("Error starting resource watcher: %v", err)
 	}
 
-	// Mark application as ready
+	// Mark application as ready only after successful startup
 	healthHandler.SetReady(true)
 	log.Printf("Resource watcher started successfully on cluster '%s' with email notifications to %s",
 		cfg.ClusterName, strings.Join(cfg.Email.ToEmails, ", "))
 
-	// Wait for context cancellation
+	// Wait for context cancellation (shutdown signal)
 	<-ctx.Done()
 	// Mark application as not ready during shutdown
 	healthHandler.SetReady(false)
