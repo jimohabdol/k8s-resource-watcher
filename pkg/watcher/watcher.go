@@ -679,37 +679,16 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 			log.Printf("Received status event: %s", status.Status)
 			if status.Status == "Failure" {
 				log.Printf("Watch failed: %s", status.Message)
-
-				// Check if it's a resource version error
-				if strings.Contains(status.Message, "too old resource version") {
-					log.Printf("Resource version too old, forcing complete reset")
-					// Force complete reset - don't use any resource version
-					lastResourceVersion = ""
-					watchState.ReconnectCount = 0
-					watchState.InitialResources = make(map[string]resourceInfo)
-					watchState.IsInitialized = false
-					watchState.ConsecutiveFailures = 0
-					watchState.ConnectionHealthy = false
-					// Don't try to reload initial resources - start completely fresh
-					log.Printf("Starting watch without resource version")
-				} else if strings.Contains(status.Message, "context canceled") ||
-					strings.Contains(status.Message, "unable to decode an event from the watch stream") {
-					log.Printf("API server context cancellation detected in status event")
-					// For API server cancellations, wait longer before retrying
-					backoffDuration := time.Duration(watchState.ConsecutiveFailures+1) * 30 * time.Second
-					if backoffDuration > 5*time.Minute {
-						backoffDuration = 5 * time.Minute
-					}
-					log.Printf("Waiting %v before retry due to API server cancellation...", backoffDuration)
-					select {
-					case <-ctx.Done():
-						log.Printf("Context cancelled during API server cancellation backoff, stopping watch for %s in namespace %s",
-							resourceConfig.Kind, resourceConfig.Namespace)
-						return
-					case <-time.After(backoffDuration):
-					}
-				}
 				break
+			}
+			continue
+		}
+
+		// Skip bookmark events
+		if event.Type == "BOOKMARK" {
+			log.Printf("Received bookmark event, updating resource version")
+			if obj, ok := event.Object.(*unstructured.Unstructured); ok {
+				lastResourceVersion = obj.GetResourceVersion()
 			}
 			continue
 		}
@@ -737,17 +716,14 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 		// Get the user who made the change
 		user := "unknown"
 		if annotations := metadata.GetAnnotations(); annotations != nil {
-			// Check multiple possible sources for user information
 			if u, ok := annotations["kubernetes.io/change-cause"]; ok {
 				user = u
 			} else if u, ok := annotations["kubectl.kubernetes.io/last-applied-configuration"]; ok {
-				// Try to extract user from kubectl apply
 				if strings.Contains(u, "kubectl") {
 					user = "kubectl"
 				}
 			}
 		}
-		// Check labels as well
 		if labels := metadata.GetLabels(); labels != nil {
 			if u, ok := labels["app.kubernetes.io/created-by"]; ok {
 				user = u
@@ -765,15 +741,14 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 			ResourceVersion: metadata.GetResourceVersion(),
 		}
 
-		// Create unique event key to prevent duplicates
-		// Include more fields to ensure uniqueness across reconnections
+		// Create unique event key
 		eventKey := fmt.Sprintf("%s:%s:%s:%s:%s:%d",
 			event.Type,
 			resourceConfig.Kind,
 			metadata.GetNamespace(),
 			metadata.GetName(),
 			metadata.GetResourceVersion(),
-			watchState.ReconnectCount) // Include reconnect count to handle reconnection scenarios
+			watchState.ReconnectCount)
 
 		// Check if we've already processed this event
 		if _, exists := processedEvents[eventKey]; exists {
@@ -782,53 +757,44 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 			continue
 		}
 
-		// Mark event as processed with TTL
+		// Mark event as processed
 		processedEvents[eventKey] = time.Now()
-
-		// Update metrics
 		w.metrics.EventsReceived++
 
-		// Check if this is a new resource or an existing one
+		// Get resource key
 		key := fmt.Sprintf("%s/%s", metadata.GetNamespace(), metadata.GetName())
 		_, isExisting := watchState.InitialResources[key]
 
 		// Track if we actually processed this event
 		eventProcessed := false
 
-		// Log the event and send notification
 		switch event.Type {
 		case "ADDED":
-			// Only send ADDED notifications for resources that are truly new
-			// A resource is considered new if:
-			// 1. It's not in our initial resources list AND
-			// 2. It was created after we started watching (with a small buffer)
+			// For ADDED events, we want to:
+			// 1. Always notify about truly new resources
+			// 2. Skip notification only for resources that existed before we started watching
 			resourceCreationTime := metadata.GetCreationTimestamp()
 			timeSinceWatchStart := time.Since(watchStartTime)
 
-			if !isExisting && watchState.IsInitialized && timeSinceWatchStart > 30*time.Second {
-				// Additional check: if we have creation timestamp, verify it's recent
+			// A resource is considered new if:
+			// 1. We haven't seen it before AND
+			// 2. Either:
+			//    a. It was created after we started watching OR
+			//    b. We're within the initial startup period (first 30 seconds)
+			if !isExisting {
+				shouldNotify := false
 				if !resourceCreationTime.IsZero() {
 					timeSinceCreation := time.Since(resourceCreationTime.Time)
 					if timeSinceCreation < timeSinceWatchStart+30*time.Second {
-						log.Printf("[%s] New resource %s/%s was ADDED by %s (created %v ago)",
-							resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user, timeSinceCreation)
-						w.notifier.SendNotification(notifier.NotificationEvent{
-							EventType:    "ADDED",
-							ResourceKind: resourceConfig.Kind,
-							ResourceName: metadata.GetName(),
-							Namespace:    metadata.GetNamespace(),
-							User:         user,
-						})
-						w.metrics.EventsProcessed++
-						eventProcessed = true
-					} else {
-						log.Printf("[%s] Resource %s/%s was created before watch start (no notification sent)",
-							resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
-						w.metrics.EventsSkipped++
+						shouldNotify = true
 					}
 				} else {
-					// No creation timestamp, use the time-based approach
-					log.Printf("[%s] New resource %s/%s was ADDED by %s (no creation timestamp)",
+					// If no creation timestamp, assume it's new if we're past initial startup
+					shouldNotify = timeSinceWatchStart > 30*time.Second
+				}
+
+				if shouldNotify {
+					log.Printf("[%s] New resource %s/%s was ADDED by %s",
 						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 					w.notifier.SendNotification(notifier.NotificationEvent{
 						EventType:    "ADDED",
@@ -839,29 +805,40 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 					})
 					w.metrics.EventsProcessed++
 					eventProcessed = true
+				} else {
+					log.Printf("[%s] Resource %s/%s discovered during initial load (no notification sent)",
+						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
 				}
-			} else if isExisting {
-				log.Printf("[%s] Existing resource %s/%s discovered during startup (no notification sent)",
-					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
-				w.metrics.EventsSkipped++
-			} else {
-				log.Printf("[%s] Resource %s/%s discovered during startup period (no notification sent)",
-					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
-				w.metrics.EventsSkipped++
 			}
-			// Always update tracking to prevent future spam
+
+			// Always update tracking
 			watchState.InitialResources[key] = resourceInfo{
 				version:  metadata.GetResourceVersion(),
 				lastSeen: time.Now(),
 			}
+
 		case "MODIFIED":
-			// Only send MODIFIED notifications for actual modifications
-			// Check if this is a real modification by comparing resource versions
-			if existingInfo, exists := watchState.InitialResources[key]; exists {
-				if existingInfo.version != metadata.GetResourceVersion() {
-					log.Printf("[%s] Resource %s/%s was MODIFIED by %s (version: %s -> %s)",
-						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user,
-						existingInfo.version, metadata.GetResourceVersion())
+			// Send notification for all modifications except during initial startup
+			if timeSinceStart := time.Since(watchStartTime); timeSinceStart > 30*time.Second {
+				if existingInfo, exists := watchState.InitialResources[key]; exists {
+					if existingInfo.version != metadata.GetResourceVersion() {
+						log.Printf("[%s] Resource %s/%s was MODIFIED by %s (version: %s -> %s)",
+							resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user,
+							existingInfo.version, metadata.GetResourceVersion())
+						w.notifier.SendNotification(notifier.NotificationEvent{
+							EventType:    "MODIFIED",
+							ResourceKind: resourceConfig.Kind,
+							ResourceName: metadata.GetName(),
+							Namespace:    metadata.GetNamespace(),
+							User:         user,
+						})
+						w.metrics.EventsProcessed++
+						eventProcessed = true
+					}
+				} else {
+					// Resource not in tracking but modified - treat as new
+					log.Printf("[%s] Resource %s/%s was MODIFIED (new resource) by %s",
+						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 					w.notifier.SendNotification(notifier.NotificationEvent{
 						EventType:    "MODIFIED",
 						ResourceKind: resourceConfig.Kind,
@@ -871,34 +848,18 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 					})
 					w.metrics.EventsProcessed++
 					eventProcessed = true
-				} else {
-					log.Printf("[%s] Resource %s/%s MODIFIED event with same version (no notification sent)",
-						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
-					w.metrics.EventsSkipped++
 				}
-			} else {
-				// Resource not in our tracking, but we're getting a MODIFIED event
-				// This could happen if we missed the ADDED event or after a reconnect
-				log.Printf("[%s] Resource %s/%s MODIFIED but not in tracking (sending notification)",
-					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
-				w.notifier.SendNotification(notifier.NotificationEvent{
-					EventType:    "MODIFIED",
-					ResourceKind: resourceConfig.Kind,
-					ResourceName: metadata.GetName(),
-					Namespace:    metadata.GetNamespace(),
-					User:         user,
-				})
-				w.metrics.EventsProcessed++
-				eventProcessed = true
 			}
+
 			// Update tracking
 			watchState.InitialResources[key] = resourceInfo{
 				version:  metadata.GetResourceVersion(),
 				lastSeen: time.Now(),
 			}
+
 		case "DELETED":
-			// Only send DELETED notifications for resources we were tracking
-			if _, exists := watchState.InitialResources[key]; exists {
+			// Always notify about deletions, except during initial startup
+			if timeSinceStart := time.Since(watchStartTime); timeSinceStart > 30*time.Second {
 				log.Printf("[%s] Resource %s/%s was DELETED by %s",
 					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 				w.notifier.SendNotification(notifier.NotificationEvent{
@@ -910,13 +871,10 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 				})
 				w.metrics.EventsProcessed++
 				eventProcessed = true
-			} else {
-				log.Printf("[%s] Resource %s/%s DELETED but not in tracking (no notification sent)",
-					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
-				w.metrics.EventsSkipped++
 			}
 			// Remove from tracking
 			delete(watchState.InitialResources, key)
+
 		default:
 			log.Printf("Skipping unknown event type: %s", event.Type)
 			w.metrics.EventsSkipped++
