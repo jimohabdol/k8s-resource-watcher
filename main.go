@@ -79,17 +79,7 @@ func main() {
 	emailNotifier := notifier.NewEmailNotifier(&cfg)
 
 	// Create resource watcher
-	resourceWatcher, err := watcher.NewResourceWatcher(&cfg, func(event *watcher.ResourceEvent) {
-		if err := emailNotifier.SendNotification(notifier.NotificationEvent{
-			EventType:    string(event.Type),
-			ResourceKind: event.ResourceKind,
-			ResourceName: event.ResourceName,
-			Namespace:    event.Namespace,
-			User:         event.User,
-		}); err != nil {
-			log.Printf("Error sending notification: %v", err)
-		}
-	}, emailNotifier)
+	resourceWatcher, err := watcher.NewResourceWatcher(&cfg, emailNotifier)
 	if err != nil {
 		log.Fatalf("Error creating resource watcher: %v", err)
 	}
