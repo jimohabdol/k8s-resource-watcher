@@ -41,6 +41,74 @@ type EmailConfig struct {
 	ToEmails     []string `yaml:"toEmails"`
 }
 
+// Validate validates the configuration
+func (c *Config) Validate() error {
+	if c.ClusterName == "" {
+		return fmt.Errorf("cluster name is required")
+	}
+
+	if len(c.Resources) == 0 {
+		return fmt.Errorf("at least one resource must be configured")
+	}
+
+	for i, resource := range c.Resources {
+		if err := resource.Validate(); err != nil {
+			return fmt.Errorf("resource[%d]: %v", i, err)
+		}
+	}
+
+	if err := c.Email.Validate(); err != nil {
+		return fmt.Errorf("email configuration: %v", err)
+	}
+
+	return nil
+}
+
+// Validate validates a resource configuration
+func (r *ResourceConfig) Validate() error {
+	if r.Kind == "" {
+		return fmt.Errorf("kind is required")
+	}
+	if r.Namespace == "" {
+		return fmt.Errorf("namespace is required")
+	}
+	return nil
+}
+
+// Validate validates email configuration
+func (e *EmailConfig) Validate() error {
+	if e.SMTPHost == "" {
+		return fmt.Errorf("SMTP host is required")
+	}
+	if e.SMTPPort <= 0 || e.SMTPPort > 65535 {
+		return fmt.Errorf("SMTP port must be between 1 and 65535")
+	}
+	if e.FromEmail == "" {
+		return fmt.Errorf("from email is required")
+	}
+	if len(e.ToEmails) == 0 {
+		return fmt.Errorf("at least one recipient email is required")
+	}
+
+	// Validate email addresses
+	for i, email := range e.ToEmails {
+		if strings.TrimSpace(email) == "" {
+			return fmt.Errorf("toEmails[%d]: email address cannot be empty", i)
+		}
+	}
+
+	if e.UseAuth {
+		if e.SMTPUsername == "" {
+			return fmt.Errorf("SMTP username is required when authentication is enabled")
+		}
+		if e.SMTPPassword == "" {
+			return fmt.Errorf("SMTP password is required when authentication is enabled")
+		}
+	}
+
+	return nil
+}
+
 // LoadEmailConfig loads email configuration with the following priority:
 // 1. Environment variables (highest priority)
 // 2. Kubernetes Secrets (if running in k8s and secrets are mounted)
@@ -48,39 +116,47 @@ type EmailConfig struct {
 func (c *Config) LoadEmailConfig() error {
 	// First, try to load from mounted Kubernetes secrets
 	if secretUsername, err := os.ReadFile("/etc/resource-watcher/secrets/smtp-username"); err == nil {
-		c.Email.SMTPUsername = string(secretUsername)
+		c.Email.SMTPUsername = strings.TrimSpace(string(secretUsername))
 		c.Email.UseAuth = true
 	}
 	if secretPassword, err := os.ReadFile("/etc/resource-watcher/secrets/smtp-password"); err == nil {
-		c.Email.SMTPPassword = string(secretPassword)
+		c.Email.SMTPPassword = strings.TrimSpace(string(secretPassword))
 		c.Email.UseAuth = true
 	}
 	if secretFromEmail, err := os.ReadFile("/etc/resource-watcher/secrets/from-email"); err == nil {
-		c.Email.FromEmail = string(secretFromEmail)
+		c.Email.FromEmail = strings.TrimSpace(string(secretFromEmail))
 	}
 	if secretToEmails, err := os.ReadFile("/etc/resource-watcher/secrets/to-emails"); err == nil {
 		// Split the comma-separated list of emails
-		c.Email.ToEmails = strings.Split(strings.TrimSpace(string(secretToEmails)), ",")
+		emails := strings.Split(strings.TrimSpace(string(secretToEmails)), ",")
+		for i, email := range emails {
+			emails[i] = strings.TrimSpace(email)
+		}
+		c.Email.ToEmails = emails
 	}
 
 	// Then, check environment variables (highest priority)
 	if username := os.Getenv("SMTP_USERNAME"); username != "" {
-		c.Email.SMTPUsername = username
+		c.Email.SMTPUsername = strings.TrimSpace(username)
 		c.Email.UseAuth = true
 	}
 	if password := os.Getenv("SMTP_PASSWORD"); password != "" {
-		c.Email.SMTPPassword = password
+		c.Email.SMTPPassword = strings.TrimSpace(password)
 		c.Email.UseAuth = true
 	}
 	if fromEmail := os.Getenv("FROM_EMAIL"); fromEmail != "" {
-		c.Email.FromEmail = fromEmail
+		c.Email.FromEmail = strings.TrimSpace(fromEmail)
 	}
 	if toEmails := os.Getenv("TO_EMAILS"); toEmails != "" {
 		// Split the comma-separated list of emails
-		c.Email.ToEmails = strings.Split(strings.TrimSpace(toEmails), ",")
+		emails := strings.Split(strings.TrimSpace(toEmails), ",")
+		for i, email := range emails {
+			emails[i] = strings.TrimSpace(email)
+		}
+		c.Email.ToEmails = emails
 	}
 	if smtpHost := os.Getenv("SMTP_HOST"); smtpHost != "" {
-		c.Email.SMTPHost = smtpHost
+		c.Email.SMTPHost = strings.TrimSpace(smtpHost)
 	}
 	if smtpPort := os.Getenv("SMTP_PORT"); smtpPort != "" {
 		var port int
@@ -92,26 +168,15 @@ func (c *Config) LoadEmailConfig() error {
 		c.Email.UseAuth = useAuth == "true"
 	}
 
-	// Validate required fields
-	if c.Email.SMTPHost == "" {
-		return fmt.Errorf("SMTP host is required")
-	}
-	if c.Email.FromEmail == "" {
-		return fmt.Errorf("From email is required")
-	}
-	if len(c.Email.ToEmails) == 0 {
-		return fmt.Errorf("At least one recipient email is required")
-	}
-
-	// Only validate auth credentials if authentication is enabled
-	if c.Email.UseAuth {
-		if c.Email.SMTPUsername == "" {
-			return fmt.Errorf("SMTP username is required when authentication is enabled")
-		}
-		if c.Email.SMTPPassword == "" {
-			return fmt.Errorf("SMTP password is required when authentication is enabled")
+	// Set defaults if not provided
+	if c.Email.SMTPPort == 0 {
+		if c.Email.UseAuth {
+			c.Email.SMTPPort = 587 // Default TLS port
+		} else {
+			c.Email.SMTPPort = 25 // Default non-TLS port
 		}
 	}
 
-	return nil
+	// Validate the final configuration
+	return c.Email.Validate()
 }

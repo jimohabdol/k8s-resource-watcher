@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s-resource-watcher/pkg/config"
@@ -23,26 +24,35 @@ type EmailMetrics struct {
 type EmailNotifier struct {
 	config  *config.Config
 	metrics *EmailMetrics
+	mu      sync.RWMutex
+	dialer  *gomail.Dialer
 }
 
 // NewEmailNotifier creates a new email notifier
 func NewEmailNotifier(cfg *config.Config) *EmailNotifier {
+	// Create dialer with appropriate settings
+	dialer := gomail.NewDialer(
+		cfg.Email.SMTPHost,
+		cfg.Email.SMTPPort,
+		cfg.Email.SMTPUsername,
+		cfg.Email.SMTPPassword,
+	)
+
+	// Configure TLS
+	dialer.TLSConfig = &tls.Config{
+		InsecureSkipVerify: false,
+		ServerName:         cfg.Email.SMTPHost,
+	}
+
 	return &EmailNotifier{
 		config:  cfg,
 		metrics: &EmailMetrics{},
+		dialer:  dialer,
 	}
 }
 
 // SendNotification sends an email notification for a resource event
 func (n *EmailNotifier) SendNotification(event NotificationEvent) error {
-	// Log email configuration details
-	log.Printf("Email Configuration: SMTP Host=%s, Port=%d, Auth=%v, From=%s, To=%s",
-		n.config.Email.SMTPHost,
-		n.config.Email.SMTPPort,
-		n.config.Email.UseAuth,
-		n.config.Email.FromEmail,
-		strings.Join(n.config.Email.ToEmails, ", "))
-
 	// Skip non-standard events
 	switch event.EventType {
 	case "ADDED", "MODIFIED", "DELETED":
@@ -80,6 +90,7 @@ This is an automated notification from the Kubernetes Resource Watcher.
 
 	m := gomail.NewMessage()
 	m.SetHeader("From", n.config.Email.FromEmail)
+
 	// Set recipients properly for gomail - use SetAddressHeader for multiple recipients
 	recipients := make([]string, len(n.config.Email.ToEmails))
 	for i, email := range n.config.Email.ToEmails {
@@ -89,20 +100,6 @@ This is an automated notification from the Kubernetes Resource Watcher.
 	m.SetHeader("Subject", subject)
 	m.SetBody("text/plain", body)
 
-	// Create dialer with appropriate settings
-	d := gomail.NewDialer(
-		n.config.Email.SMTPHost,
-		n.config.Email.SMTPPort,
-		n.config.Email.SMTPUsername,
-		n.config.Email.SMTPPassword,
-	)
-
-	// Configure TLS
-	d.TLSConfig = &tls.Config{
-		InsecureSkipVerify: false,
-		ServerName:         n.config.Email.SMTPHost,
-	}
-
 	// Implement retry logic with exponential backoff
 	maxRetries := 3
 	backoff := 1 * time.Second
@@ -110,7 +107,7 @@ This is an automated notification from the Kubernetes Resource Watcher.
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Send the email
-		if err := d.DialAndSend(m); err != nil {
+		if err := n.dialer.DialAndSend(m); err != nil {
 			lastErr = err
 			log.Printf("Failed to send email notification (attempt %d/%d): %v", attempt, maxRetries, err)
 
@@ -120,16 +117,27 @@ This is an automated notification from the Kubernetes Resource Watcher.
 				backoff *= 2 // Exponential backoff
 				continue
 			}
+			n.mu.Lock()
 			n.metrics.EmailsFailed++
+			n.mu.Unlock()
 			return fmt.Errorf("failed to send email after %d attempts: %v", maxRetries, lastErr)
 		}
 
 		// Success
+		n.mu.Lock()
 		n.metrics.EmailsSent++
+		n.mu.Unlock()
 		log.Printf("Successfully sent email notification for %s %s in namespace %s to %s",
 			event.ResourceKind, event.ResourceName, event.Namespace, strings.Join(n.config.Email.ToEmails, ", "))
 		return nil
 	}
 
 	return lastErr
+}
+
+// GetMetrics returns a copy of the current metrics
+func (n *EmailNotifier) GetMetrics() EmailMetrics {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return *n.metrics
 }

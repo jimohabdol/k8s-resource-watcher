@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -30,6 +31,8 @@ type ResourceWatcher struct {
 	notifier     notifier.Notifier
 	ctx          context.Context
 	cancel       context.CancelFunc
+	mu           sync.RWMutex
+	watchers     map[string]*ResourceWatchState
 }
 
 // WatcherMetrics tracks watcher statistics
@@ -104,6 +107,7 @@ func NewResourceWatcher(cfg *config.Config, eventHandler func(event *ResourceEve
 		notifier:     notifier,
 		ctx:          ctx,
 		cancel:       cancel,
+		watchers:     make(map[string]*ResourceWatchState),
 	}, nil
 }
 
@@ -120,25 +124,48 @@ func (w *ResourceWatcher) Start(ctx context.Context) error {
 		}(resource)
 	}
 
-	// Wait a moment to ensure all goroutines have started
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(100 * time.Millisecond):
-		// All goroutines should have started by now
-	}
-
 	return nil
 }
 
 // Stop gracefully stops all watchers
 func (w *ResourceWatcher) Stop() {
 	w.cancel()
+
+	// Clean up all watchers
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for key, watchState := range w.watchers {
+		if watchState.WatchInterface != nil {
+			watchState.WatchInterface.Stop()
+		}
+		delete(w.watchers, key)
+	}
+}
+
+// GetMetrics returns a copy of the current metrics
+func (w *ResourceWatcher) GetMetrics() WatcherMetrics {
+	return *w.metrics
+}
+
+// GetWatcherState returns the state of all watchers
+func (w *ResourceWatcher) GetWatcherState() map[string]*ResourceWatchState {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	state := make(map[string]*ResourceWatchState)
+	for key, watchState := range w.watchers {
+		state[key] = watchState
+	}
+	return state
 }
 
 func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig config.ResourceConfig) {
+	// Create a unique key for this watcher
+	watcherKey := fmt.Sprintf("%s/%s/%s", resourceConfig.Kind, resourceConfig.Namespace, resourceConfig.ResourceName)
+
 	// Get the GVR for the resource kind
-	gvr := getGroupVersionResource(resourceConfig.Kind)
+	gvr := GetGroupVersionResource(resourceConfig.Kind)
 	if gvr.Empty() {
 		log.Printf("Error: Unknown resource kind %s", resourceConfig.Kind)
 		return
@@ -170,6 +197,22 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 		LastHeartbeat:       time.Now(),
 		ConnectionHealthy:   false,
 	}
+
+	// Register this watcher
+	w.mu.Lock()
+	w.watchers[watcherKey] = watchState
+	w.mu.Unlock()
+
+	// Ensure cleanup on exit
+	defer func() {
+		w.mu.Lock()
+		if watchState.WatchInterface != nil {
+			watchState.WatchInterface.Stop()
+		}
+		delete(w.watchers, watcherKey)
+		w.mu.Unlock()
+		log.Printf("Cleaned up watcher for %s", watcherKey)
+	}()
 
 	// Track when we actually start watching (after initial loading)
 	watchStartTime := time.Time{}
@@ -796,7 +839,8 @@ func min(a, b time.Duration) time.Duration {
 	return b
 }
 
-func getGroupVersionResource(kind string) schema.GroupVersionResource {
+// GetGroupVersionResource returns the GroupVersionResource for a given resource kind
+func GetGroupVersionResource(kind string) schema.GroupVersionResource {
 	// Map common resource kinds to their GVR
 	switch kind {
 	case "ConfigMap":

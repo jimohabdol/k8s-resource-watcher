@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -33,6 +34,11 @@ func main() {
 	var cfg config.Config
 	if err := yaml.Unmarshal(configData, &cfg); err != nil {
 		log.Fatalf("Error parsing config file: %v", err)
+	}
+
+	// Validate configuration
+	if err := validateConfiguration(&cfg); err != nil {
+		log.Fatalf("Configuration validation failed: %v", err)
 	}
 
 	// Load email configuration with priority handling
@@ -111,8 +117,8 @@ func main() {
 		}
 	}()
 
-	// Start watching resources with a timeout context
-	startCtx, startCancel := context.WithTimeout(ctx, 60*time.Second)
+	// Start watching resources with startup timeout
+	startCtx, startCancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer startCancel()
 
 	if err := resourceWatcher.Start(startCtx); err != nil {
@@ -129,4 +135,42 @@ func main() {
 	// Mark application as not ready during shutdown
 	healthHandler.SetReady(false)
 	log.Println("Shutting down...")
+}
+
+// validateConfiguration validates the configuration before starting the application
+func validateConfiguration(cfg *config.Config) error {
+	if len(cfg.Resources) == 0 {
+		return fmt.Errorf("no resources configured to watch")
+	}
+
+	for i, resource := range cfg.Resources {
+		if resource.Kind == "" {
+			return fmt.Errorf("resource[%d]: kind is required", i)
+		}
+		if resource.Namespace == "" {
+			return fmt.Errorf("resource[%d]: namespace is required", i)
+		}
+
+		// Validate resource kind
+		gvr := watcher.GetGroupVersionResource(resource.Kind)
+		if gvr.Empty() {
+			return fmt.Errorf("resource[%d]: unknown resource kind '%s'", i, resource.Kind)
+		}
+	}
+
+	// Set default watcher configuration if not provided
+	if cfg.Watcher.WatchTimeoutSeconds == 0 {
+		cfg.Watcher.WatchTimeoutSeconds = 600 // 10 minutes
+	}
+	if cfg.Watcher.MaxReconnects == 0 {
+		cfg.Watcher.MaxReconnects = 5
+	}
+	if cfg.Watcher.ReconnectBackoffMs == 0 {
+		cfg.Watcher.ReconnectBackoffMs = 5000 // 5 seconds
+	}
+	if cfg.Watcher.HeartbeatIntervalMs == 0 {
+		cfg.Watcher.HeartbeatIntervalMs = 30000 // 30 seconds
+	}
+
+	return nil
 }
