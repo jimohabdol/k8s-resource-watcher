@@ -1,0 +1,65 @@
+clusterName: "my-cluster"
+
+# List of resources to watch
+resources:
+  - kind: "ConfigMap"
+    namespace: "default"  # empty for all namespaces
+  - kind: "Secret"
+    namespace: "kube-system"
+  # Add more resources as needed
+  # - kind: "Deployment"
+  #   namespace: "apps"
+
+# Watcher configuration (optional)
+watcher:
+  watchTimeoutSeconds: 900    # 15 minutes - longer for production
+  maxReconnects: 3            # Fewer reconnects with keep-alive
+  reconnectBackoffMs: 3000    # Faster reconnection
+  heartbeatIntervalMs: 60000  # 1 minute - less frequent
+  keepAliveEnabled: true     # Enable keep-alive functionality
+  
+  # Advanced optimizations for production environments
+  eventBatchIntervalMs: 5000    # Process events every 5 seconds
+  eventBufferSize: 100          # Buffer up to 100 events
+  maxConcurrentWatches: 5       # Maximum 5 concurrent watchers
+  resourceVersionTTL: 3600      # Resource version TTL: 1 hour
+  notificationCooldown: 30      # Notification cooldown: 30 seconds
+  modificationCooldown: 10      # Modification event cooldown: 10 seconds
+  
+  # Enhanced optimization settings
+  eventBatchIntervalMs: 5000    # Process events every 5 seconds
+  eventBufferSize: 100          # Buffer up to 100 events
+  maxConcurrentWatches: 5       # Maximum 5 concurrent watchers
+  resourceVersionTTL: 3600      # Resource version TTL: 1 hour
+
+# Email configuration
+# These values can be overridden using environment variables or Kubernetes secrets
+email:
+  # SMTP server configuration
+  smtpHost: "smtp.example.com"
+  smtpPort: 25  # Common port for non-authenticated SMTP
+  
+  # Authentication settings (optional)
+  useAuth: false  # Set to true if your SMTP server requires authentication
+  # smtpUsername: "your-email@gmail.com"  # Only needed if useAuth is true
+  # smtpPassword: "your-app-specific-password"  # Only needed if useAuth is true
+  
+  # Email addresses
+  fromEmail: "notifications@example.com"
+  toEmails:  # List of recipient email addresses
+    - "recipient1@example.com"
+    - "recipient2@example.com"
+    - "team@example.com"
+
+# Example with authentication enabled:
+# email:
+#   smtpHost: "smtp.gmail.com"
+#   smtpPort: 587
+#   useAuth: true
+#   smtpUsername: "your-email@gmail.com"
+#   smtpPassword: "your-app-specific-password"
+#   fromEmail: "your-email@gmail.com"
+#   toEmails:
+#     - "recipient1@example.com"
+#     - "recipient2@example.com"
+#     - "team@example.com" 
