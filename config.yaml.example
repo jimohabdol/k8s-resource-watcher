@@ -31,6 +31,19 @@ watcher:
   eventBufferSize: 100          # Buffer up to 100 events
   maxConcurrentWatches: 5       # Maximum 5 concurrent watchers
   resourceVersionTTL: 3600      # Resource version TTL: 1 hour
+  
+  # Deployment monitoring configuration (optional)
+  # Fields to monitor for changes in deployments
+  deploymentImportantFields:
+    - "containers"
+    - "volumes"
+    - "serviceAccountName"
+    - "nodeSelector"
+    - "affinity"
+    - "tolerations"
+    - "securityContext"
+    - "imagePullSecrets"
+    - "hostAliases"
 
 # Email configuration
 # These values can be overridden using environment variables or Kubernetes secrets

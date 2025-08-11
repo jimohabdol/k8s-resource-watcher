@@ -421,32 +421,13 @@ func (w *ResourceWatcher) hasDeploymentImportantFieldsChanged(oldObj, newObj *un
 		return true
 	}
 
-	importantFields := []string{
-		"containers",
-		"volumes",
-		"serviceAccountName",
-		"nodeSelector",
-		"affinity",
-		"tolerations",
-		"securityContext",
-		"imagePullSecrets",
-	}
+	importantFields := w.config.Watcher.GetDeploymentImportantFields()
 
 	for _, field := range importantFields {
-		oldValue := oldTemplateSpec[field]
-		newValue := newTemplateSpec[field]
-
-		if !reflect.DeepEqual(oldValue, newValue) {
+		if w.hasFieldChanged(oldTemplateSpec, newTemplateSpec, field) {
 			log.Printf("Deployment important field '%s' changed", field)
 			return true
 		}
-	}
-
-	oldReplicas := oldSpec["replicas"]
-	newReplicas := newSpec["replicas"]
-	if !reflect.DeepEqual(oldReplicas, newReplicas) {
-		log.Printf("Deployment replicas changed from %v to %v", oldReplicas, newReplicas)
-		return true
 	}
 
 	oldStrategy := oldSpec["strategy"]
@@ -458,6 +439,57 @@ func (w *ResourceWatcher) hasDeploymentImportantFieldsChanged(oldObj, newObj *un
 
 	log.Printf("Deployment change detected but no important fields modified - likely status change (pod restart)")
 	return false
+}
+
+// hasFieldChanged checks if a field has changed, handling both direct and nested field paths
+func (w *ResourceWatcher) hasFieldChanged(oldSpec, newSpec map[string]interface{}, fieldName string) bool {
+	// Handle special nested field cases
+	switch fieldName {
+	case "hostAliases":
+		return w.hasContainerHostAliasesChanged(oldSpec, newSpec)
+	case "securityContext":
+		return w.hasSecurityContextChanged(oldSpec, newSpec)
+	default:
+		oldValue := oldSpec[fieldName]
+		newValue := newSpec[fieldName]
+		return !reflect.DeepEqual(oldValue, newValue)
+	}
+}
+
+// hasContainerHostAliasesChanged checks if container hostAliases have changed
+func (w *ResourceWatcher) hasContainerHostAliasesChanged(oldSpec, newSpec map[string]interface{}) bool {
+	oldHostAliases := oldSpec["hostAliases"]
+	newHostAliases := newSpec["hostAliases"]
+
+	return !reflect.DeepEqual(oldHostAliases, newHostAliases)
+}
+
+// hasSecurityContextChanged checks if security context has changed (pod or container level)
+func (w *ResourceWatcher) hasSecurityContextChanged(oldSpec, newSpec map[string]interface{}) bool {
+	oldPodSecurityContext := oldSpec["securityContext"]
+	newPodSecurityContext := newSpec["securityContext"]
+	if !reflect.DeepEqual(oldPodSecurityContext, newPodSecurityContext) {
+		return true
+	}
+
+	oldContainers, oldExists := oldSpec["containers"].([]interface{})
+	newContainers, newExists := newSpec["containers"].([]interface{})
+
+	if !oldExists || !newExists || len(oldContainers) == 0 || len(newContainers) == 0 {
+		return oldExists != newExists
+	}
+
+	oldContainer, oldOk := oldContainers[0].(map[string]interface{})
+	newContainer, newOk := newContainers[0].(map[string]interface{})
+
+	if !oldOk || !newOk {
+		return oldOk != newOk
+	}
+
+	oldContainerSecurityContext := oldContainer["securityContext"]
+	newContainerSecurityContext := newContainer["securityContext"]
+
+	return !reflect.DeepEqual(oldContainerSecurityContext, newContainerSecurityContext)
 }
 
 type ResourceEvent struct {
@@ -595,7 +627,6 @@ func (w *ResourceWatcher) startEventProcessor() {
 		maxBatchInterval := 30 * time.Second
 		currentBatchInterval := batchInterval
 
-		// Memory management: cleanup old notification tracking entries
 		cleanupTicker := time.NewTicker(5 * time.Minute)
 		defer cleanupTicker.Stop()
 
@@ -664,7 +695,6 @@ func (w *ResourceWatcher) processEventBatchEnhanced(events []*ResourceEvent, las
 
 	log.Printf("Processing enhanced batch of %d events", len(events))
 
-	// Sort events by priority
 	highPriority := make([]*ResourceEvent, 0)
 	mediumPriority := make([]*ResourceEvent, 0)
 	lowPriority := make([]*ResourceEvent, 0)
@@ -680,7 +710,6 @@ func (w *ResourceWatcher) processEventBatchEnhanced(events []*ResourceEvent, las
 		}
 	}
 
-	// Process high priority events first
 	notificationsSent := 0
 	correlatedEvents := make(map[string][]*ResourceEvent)
 
@@ -1487,7 +1516,9 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 					if existingInfo.version != metadata.GetResourceVersion() {
 						shouldNotify := true
 						if existingInfo.object != nil {
-							shouldNotify = w.shouldNotifyForChange(resourceConfig.Kind, existingInfo.object, obj)
+							// Store the old object for comparison before updating it
+							oldObject := existingInfo.object
+							shouldNotify = w.shouldNotifyForChange(resourceConfig.Kind, oldObject, obj)
 						}
 
 						if shouldNotify {
@@ -1547,6 +1578,7 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 				}
 			}
 
+			// Update the stored object AFTER processing the event
 			watchState.InitialResources[key] = resourceInfo{
 				version:  metadata.GetResourceVersion(),
 				lastSeen: time.Now(),

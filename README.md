@@ -98,6 +98,7 @@ email:
   - `maxReconnects`: Maximum reconnects before resetting state (default: 5)
   - `reconnectBackoffMs`: Base backoff time in milliseconds (default: 5000)
   - `heartbeatIntervalMs`: Heartbeat interval for keep-alive (default: 30000 ms)
+  - `deploymentImportantFields`: (Optional) Fields to monitor for changes in deployments. If not specified, defaults to: containers, volumes, serviceAccountName, nodeSelector, affinity, tolerations, securityContext, imagePullSecrets, hostAliases, env
   - `keepAliveEnabled`: Enable keep-alive functionality (default: true)
 - `email`: SMTP configuration
   - `smtpHost`: SMTP server hostname
@@ -201,6 +202,41 @@ The watcher now intelligently filters changes based on resource type to eliminat
 - ✅ **Annotations** - Ingress controller changes
 
 This eliminates notification spam from routine pod restarts while ensuring you're alerted to meaningful configuration changes.
+
+### Deployment Monitoring Best Practices
+
+When monitoring deployments, consider which fields are important for your use case:
+
+**Fields that typically indicate important changes:**
+- `containers` - Image updates, resource limits, command changes
+- `volumes` - ConfigMap/Secret mounts, persistent storage
+- `serviceAccountName` - Security context changes
+- `nodeSelector` - Scheduling changes
+- `affinity` - Pod placement rules
+- `tolerations` - Node taint handling
+- `securityContext` - Security policy changes
+- `imagePullSecrets` - Registry authentication
+- `hostAliases` - DNS resolution changes
+
+**Fields to consider carefully:**
+- `replicas` - Usually managed by HPA, can cause notification spam
+- `strategy` - Deployment strategy changes (rolling update vs recreate)
+- `progressDeadlineSeconds` - Deployment timeout configuration
+
+**Example configuration to skip replica changes:**
+```yaml
+watcher:
+  deploymentImportantFields:
+    - "containers"
+    - "volumes"
+    - "serviceAccountName"
+    - "nodeSelector"
+    - "affinity"
+    - "tolerations"
+    - "securityContext"
+    - "imagePullSecrets"
+    - "hostAliases"
+```
 
 ### Multiple Recipients
 

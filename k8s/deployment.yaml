@@ -18,7 +18,6 @@ spec:
         openshift.io/scc: restricted
     spec:
       serviceAccountName: resource-watcher
-      # Pod-level security context (inherited by all containers)
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -26,9 +25,8 @@ spec:
         fsGroup: 2000
       containers:
       - name: resource-watcher
-        image: resource-watcher:latest
+        image: resource-watcher:1.0.0
         imagePullPolicy: IfNotPresent
-        # Container-specific security context (only essential settings)
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

@@ -13,22 +13,4 @@ spec:
     name: http
   selector:
     app: resource-watcher
----
-# OpenShift Route (Optional - Only for OpenShift clusters)
-apiVersion: route.openshift.io/v1
-kind: Route
-metadata:
-  name: resource-watcher
-  namespace: default
-  labels:
-    app: resource-watcher
-spec:
-  port:
-    targetPort: http
-  to:
-    kind: Service
-    name: resource-watcher
-    weight: 100
-  tls:
-    termination: edge
-    insecureEdgeTerminationPolicy: Redirect 
+ 

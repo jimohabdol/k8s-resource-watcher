@@ -28,6 +28,8 @@ type WatcherConfig struct {
 	ResourceVersionTTL   int64 `yaml:"resourceVersionTTL,omitempty"`   // TTL for resource versions in seconds
 	NotificationCooldown int64 `yaml:"notificationCooldown,omitempty"` // Cooldown period for notifications in seconds
 	ModificationCooldown int64 `yaml:"modificationCooldown,omitempty"` // Cooldown period for modification events in seconds
+	// Deployment monitoring configuration
+	DeploymentImportantFields []string `yaml:"deploymentImportantFields,omitempty"` // Fields to monitor for changes in deployments
 }
 
 type ResourceConfig struct {
@@ -172,4 +174,25 @@ func (c *Config) LoadEmailConfig() error {
 
 	// Validate the final configuration
 	return c.Email.Validate()
+}
+
+// GetDeploymentImportantFields returns the deployment important fields, with defaults if not configured
+func (w *WatcherConfig) GetDeploymentImportantFields() []string {
+	if len(w.DeploymentImportantFields) > 0 {
+		return w.DeploymentImportantFields
+	}
+
+	// Default important fields for deployments
+	return []string{
+		"containers",
+		"volumes",
+		"serviceAccountName",
+		"nodeSelector",
+		"affinity",
+		"tolerations",
+		"securityContext",
+		"imagePullSecrets",
+		"hostAliases",
+		"env",
+	}
 }

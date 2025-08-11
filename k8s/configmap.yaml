@@ -20,6 +20,19 @@ data:
       eventBufferSize: 100          # Buffer up to 100 events
       maxConcurrentWatches: 5       # Maximum 5 concurrent watchers
       resourceVersionTTL: 3600      # Resource version TTL: 1 hour
+      
+      # Deployment monitoring configuration
+      deploymentImportantFields:
+        - "containers"
+        - "volumes"
+        - "serviceAccount"
+        - "nodeSelector"
+        - "affinity"
+        - "tolerations"
+        - "securityContext"
+        - "imagePullSecrets"
+        - "hostAliases"
+        # Note: replicas, strategy, and other fields are intentionally excluded
 
     resources:
       # Watch all ConfigMaps in the dev namespace
