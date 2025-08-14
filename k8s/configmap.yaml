@@ -25,7 +25,7 @@ data:
       deploymentImportantFields:
         - "containers"
         - "volumes"
-        - "serviceAccount"
+        - "serviceAccountName"
         - "nodeSelector"
         - "affinity"
         - "tolerations"
@@ -57,7 +57,7 @@ data:
         resourceName: api-server
 
     email:
-      smtpHost: "smtp.gmail.com"
+      smtpHost: ""
       smtpPort: 587
       useAuth: true
       # Credentials will be loaded from environment variables (set by secretKeyRef)

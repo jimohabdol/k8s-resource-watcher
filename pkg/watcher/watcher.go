@@ -64,6 +64,8 @@ type EventFrequencyTracker struct {
 	eventCounts     map[string]int       // resourceKey - event count
 	lastEventTimes  map[string]time.Time // resourceKey - last event time
 	frequencyWindow time.Duration        // Time window for frequency calculation
+	cleanupTicker   *time.Ticker
+	stopChan        chan struct{}
 }
 
 type AdaptiveCooldown struct {
@@ -93,14 +95,60 @@ const (
 	PriorityHigh EventPriority = iota
 	PriorityMedium
 	PriorityLow
+
+	DefaultWatchStartupDelay     = 30 * time.Second
+	DefaultResourceCreationDelay = 30 * time.Second
+	DefaultBatchInterval         = 5 * time.Second
+	DefaultMinBatchInterval      = 1 * time.Second
+	DefaultMaxBatchInterval      = 30 * time.Second
+	DefaultMaxBatchSize          = 50
+	DefaultCleanupInterval       = 5 * time.Minute
+	DefaultFrequencyCleanup      = 10 * time.Minute
+	DefaultFrequencyWindow       = 5 * time.Minute
+	DefaultBaseCooldown          = 10 * time.Second
 )
 
 func newEventFrequencyTracker() *EventFrequencyTracker {
-	return &EventFrequencyTracker{
+	tracker := &EventFrequencyTracker{
 		eventCounts:     make(map[string]int),
 		lastEventTimes:  make(map[string]time.Time),
-		frequencyWindow: 60 * time.Second, // 1 minute window
+		frequencyWindow: DefaultFrequencyWindow,
+		stopChan:        make(chan struct{}),
 	}
+	tracker.startCleanup()
+	return tracker
+}
+
+func (t *EventFrequencyTracker) startCleanup() {
+	t.cleanupTicker = time.NewTicker(DefaultFrequencyCleanup)
+	go func() {
+		for {
+			select {
+			case <-t.cleanupTicker.C:
+				t.cleanup()
+			case <-t.stopChan:
+				t.cleanupTicker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+func (t *EventFrequencyTracker) cleanup() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	cutoff := time.Now().Add(-t.frequencyWindow)
+	for key, lastTime := range t.lastEventTimes {
+		if lastTime.Before(cutoff) {
+			delete(t.eventCounts, key)
+			delete(t.lastEventTimes, key)
+		}
+	}
+}
+
+func (t *EventFrequencyTracker) Stop() {
+	close(t.stopChan)
 }
 
 func newAdaptiveCooldown(baseCooldown time.Duration) *AdaptiveCooldown {
@@ -398,19 +446,35 @@ func (w *ResourceWatcher) hasIngressSpecChanged(oldObj, newObj *unstructured.Uns
 
 // hasDeploymentImportantFieldsChanged checks if important Deployment fields have changed
 func (w *ResourceWatcher) hasDeploymentImportantFieldsChanged(oldObj, newObj *unstructured.Unstructured) bool {
-	// Get the spec sections
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Panic recovered in hasDeploymentImportantFieldsChanged: %v", r)
+		}
+	}()
+
+	if oldObj == nil || newObj == nil {
+		log.Printf("Warning: nil object passed to hasDeploymentImportantFieldsChanged")
+		return false
+	}
+
+	if oldObj.Object == nil || newObj.Object == nil {
+		log.Printf("Warning: nil Object field in unstructured object")
+		return false
+	}
+
 	oldSpec, oldExists := oldObj.Object["spec"].(map[string]interface{})
 	newSpec, newExists := newObj.Object["spec"].(map[string]interface{})
 
 	if !oldExists || !newExists {
-		return true // If spec doesn't exist, consider it a change
+		log.Printf("Deployment spec section missing - old: %v, new: %v", oldExists, newExists)
+		return true
 	}
 
-	// Check if template spec has changed (this includes containers, volumes, etc.)
 	oldTemplate, oldTemplateExists := oldSpec["template"].(map[string]interface{})
 	newTemplate, newTemplateExists := newSpec["template"].(map[string]interface{})
 
 	if !oldTemplateExists || !newTemplateExists {
+		log.Printf("Deployment template section missing - old: %v, new: %v", oldTemplateExists, newTemplateExists)
 		return true
 	}
 
@@ -418,22 +482,45 @@ func (w *ResourceWatcher) hasDeploymentImportantFieldsChanged(oldObj, newObj *un
 	newTemplateSpec, newTemplateSpecExists := newTemplate["spec"].(map[string]interface{})
 
 	if !oldTemplateSpecExists || !newTemplateSpecExists {
+		log.Printf("Deployment template spec section missing - old: %v, new: %v", newTemplateSpecExists, newTemplateSpecExists)
 		return true
 	}
 
 	importantFields := w.config.Watcher.GetDeploymentImportantFields()
+	if len(importantFields) == 0 {
+		log.Printf("Warning: No deployment important fields configured, using defaults")
+		importantFields = []string{"containers", "volumes", "serviceAccountName", "nodeSelector", "affinity", "tolerations", "securityContext", "imagePullSecrets", "hostAliases", "env"}
+	}
+
+	log.Printf("Checking %d important fields for deployment changes: %v", len(importantFields), importantFields)
 
 	for _, field := range importantFields {
+		log.Printf("Checking field '%s' for changes", field)
 		if w.hasFieldChanged(oldTemplateSpec, newTemplateSpec, field) {
-			log.Printf("Deployment important field '%s' changed", field)
+			log.Printf("Deployment important field '%s' changed - NOTIFICATION TRIGGERED", field)
 			return true
 		}
+		log.Printf("Field '%s' unchanged", field)
 	}
 
 	oldStrategy := oldSpec["strategy"]
 	newStrategy := newSpec["strategy"]
 	if !reflect.DeepEqual(oldStrategy, newStrategy) {
-		log.Printf("Deployment strategy changed")
+		log.Printf("Deployment strategy changed - NOTIFICATION TRIGGERED")
+		return true
+	}
+
+	oldReplicas := oldSpec["replicas"]
+	newReplicas := newSpec["replicas"]
+	if !reflect.DeepEqual(oldReplicas, newReplicas) {
+		log.Printf("Deployment replicas changed - NOTIFICATION TRIGGERED")
+		return true
+	}
+
+	oldSelector := oldSpec["selector"]
+	newSelector := newSpec["selector"]
+	if !reflect.DeepEqual(oldSelector, newSelector) {
+		log.Printf("Deployment selector changed - NOTIFICATION TRIGGERED")
 		return true
 	}
 
@@ -441,14 +528,88 @@ func (w *ResourceWatcher) hasDeploymentImportantFieldsChanged(oldObj, newObj *un
 	return false
 }
 
-// hasFieldChanged checks if a field has changed, handling both direct and nested field paths
+// hasImportantFieldsChanged checks if any important fields have changed for a resource
+// This method determines whether to bypass cooldowns for critical changes
+func (w *ResourceWatcher) hasImportantFieldsChanged(resourceKind string, oldObj, newObj *unstructured.Unstructured) bool {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Panic recovered in hasImportantFieldsChanged for %s: %v", resourceKind, r)
+		}
+	}()
+
+	if oldObj == nil || newObj == nil {
+		log.Printf("Warning: nil object passed to hasImportantFieldsChanged for %s", resourceKind)
+		return false
+	}
+
+	if oldObj.Object == nil || newObj.Object == nil {
+		log.Printf("Warning: nil Object field in unstructured object for %s", resourceKind)
+		return false
+	}
+
+	switch resourceKind {
+	case "Deployment":
+		return w.hasDeploymentImportantFieldsChanged(oldObj, newObj)
+	case "ConfigMap":
+		oldData := oldObj.Object["data"]
+		newData := newObj.Object["data"]
+		return !reflect.DeepEqual(oldData, newData)
+	case "Secret":
+		oldData := oldObj.Object["data"]
+		newData := newObj.Object["data"]
+		return !reflect.DeepEqual(oldData, newData)
+	case "Service":
+		oldSpec := oldObj.Object["spec"]
+		newSpec := newObj.Object["spec"]
+		return !reflect.DeepEqual(oldSpec, newSpec)
+	case "Ingress":
+		oldSpec := oldObj.Object["spec"]
+		newSpec := newObj.Object["spec"]
+		return !reflect.DeepEqual(oldSpec, newSpec)
+	default:
+		return true
+	}
+}
+
 func (w *ResourceWatcher) hasFieldChanged(oldSpec, newSpec map[string]interface{}, fieldName string) bool {
-	// Handle special nested field cases
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Panic recovered in hasFieldChanged for field '%s': %v", fieldName, r)
+		}
+	}()
+
+	if oldSpec == nil || newSpec == nil {
+		log.Printf("Warning: nil spec passed to hasFieldChanged for field '%s'", fieldName)
+		return false
+	}
+
 	switch fieldName {
-	case "hostAliases":
-		return w.hasContainerHostAliasesChanged(oldSpec, newSpec)
+	case "containers":
+		return w.hasContainersChanged(oldSpec, newSpec)
+	case "volumes":
+		return w.hasVolumesChanged(oldSpec, newSpec)
+	case "env":
+		return w.hasEnvChanged(oldSpec, newSpec)
+	case "imagePullSecrets":
+		return w.hasImagePullSecretsChanged(oldSpec, newSpec)
+	case "nodeSelector":
+		return w.hasNodeSelectorChanged(oldSpec, newSpec)
+	case "affinity":
+		return w.hasAffinityChanged(oldSpec, newSpec)
+	case "tolerations":
+		return w.hasTolerationsChanged(oldSpec, newSpec)
+	case "serviceAccountName":
+		oldValue := oldSpec["serviceAccountName"]
+		newValue := newSpec["serviceAccountName"]
+		return !reflect.DeepEqual(oldValue, newValue)
 	case "securityContext":
-		return w.hasSecurityContextChanged(oldSpec, newSpec)
+		oldValue := oldSpec["securityContext"]
+		newValue := newSpec["securityContext"]
+		return !reflect.DeepEqual(oldValue, newValue)
+	case "hostAliases":
+		oldValue := oldSpec["hostAliases"]
+		newValue := newSpec["hostAliases"]
+		return !reflect.DeepEqual(oldValue, newValue)
 	default:
 		oldValue := oldSpec[fieldName]
 		newValue := newSpec[fieldName]
@@ -492,6 +653,98 @@ func (w *ResourceWatcher) hasSecurityContextChanged(oldSpec, newSpec map[string]
 	return !reflect.DeepEqual(oldContainerSecurityContext, newContainerSecurityContext)
 }
 
+func (w *ResourceWatcher) hasContainersChanged(oldSpec, newSpec map[string]interface{}) bool {
+	oldContainers := oldSpec["containers"]
+	newContainers := newSpec["containers"]
+
+	changed := !reflect.DeepEqual(oldContainers, newContainers)
+	if changed {
+		log.Printf("Containers field changed detected - old: %T, new: %T", oldContainers, newContainers)
+		if oldContainers != nil && newContainers != nil {
+			if oldContainersSlice, ok := oldContainers.([]interface{}); ok {
+				if newContainersSlice, ok := newContainers.([]interface{}); ok {
+					log.Printf("Container count - old: %d, new: %d", len(oldContainersSlice), len(newContainersSlice))
+					if len(oldContainersSlice) > 0 && len(newContainersSlice) > 0 {
+						if oldContainer, ok := oldContainersSlice[0].(map[string]interface{}); ok {
+							if newContainer, ok := newContainersSlice[0].(map[string]interface{}); ok {
+								oldImage := oldContainer["image"]
+								newImage := newContainer["image"]
+								if !reflect.DeepEqual(oldImage, newImage) {
+									log.Printf("Container image changed - old: %v, new: %v", oldImage, newImage)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	} else {
+		log.Printf("Containers field unchanged")
+	}
+
+	return changed
+}
+
+func (w *ResourceWatcher) hasVolumesChanged(oldSpec, newSpec map[string]interface{}) bool {
+	oldVolumes := oldSpec["volumes"]
+	newVolumes := newSpec["volumes"]
+	return !reflect.DeepEqual(oldVolumes, newVolumes)
+}
+
+func (w *ResourceWatcher) hasEnvChanged(oldSpec, newSpec map[string]interface{}) bool {
+	oldContainers, oldExists := oldSpec["containers"].([]interface{})
+	newContainers, newExists := newSpec["containers"].([]interface{})
+
+	if !oldExists || !newExists {
+		return oldExists != newExists
+	}
+
+	if len(oldContainers) != len(newContainers) {
+		return true
+	}
+
+	for i, oldContainer := range oldContainers {
+		if i >= len(newContainers) {
+			return true
+		}
+		oldContainerMap, oldOk := oldContainer.(map[string]interface{})
+		newContainerMap, newOk := newContainers[i].(map[string]interface{})
+		if !oldOk || !newOk {
+			return oldOk != newOk
+		}
+		oldEnv := oldContainerMap["env"]
+		newEnv := newContainerMap["env"]
+		if !reflect.DeepEqual(oldEnv, newEnv) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *ResourceWatcher) hasImagePullSecretsChanged(oldSpec, newSpec map[string]interface{}) bool {
+	oldImagePullSecrets := oldSpec["imagePullSecrets"]
+	newImagePullSecrets := newSpec["imagePullSecrets"]
+	return !reflect.DeepEqual(oldImagePullSecrets, newImagePullSecrets)
+}
+
+func (w *ResourceWatcher) hasNodeSelectorChanged(oldSpec, newSpec map[string]interface{}) bool {
+	oldNodeSelector := oldSpec["nodeSelector"]
+	newNodeSelector := newSpec["nodeSelector"]
+	return !reflect.DeepEqual(oldNodeSelector, newNodeSelector)
+}
+
+func (w *ResourceWatcher) hasAffinityChanged(oldSpec, newSpec map[string]interface{}) bool {
+	oldAffinity := oldSpec["affinity"]
+	newAffinity := newSpec["affinity"]
+	return !reflect.DeepEqual(oldAffinity, newAffinity)
+}
+
+func (w *ResourceWatcher) hasTolerationsChanged(oldSpec, newSpec map[string]interface{}) bool {
+	oldTolerations := oldSpec["tolerations"]
+	newTolerations := newSpec["tolerations"]
+	return !reflect.DeepEqual(oldTolerations, newTolerations)
+}
+
 type ResourceEvent struct {
 	Type            watch.EventType
 	ResourceKind    string
@@ -505,9 +758,9 @@ type ResourceEvent struct {
 }
 
 type ResourceWatchState struct {
-	LastResourceVersion string
-	ResourceVersionInfo *ResourceVersionInfo
+	mu                  sync.RWMutex
 	InitialResources    map[string]resourceInfo
+	ResourceVersionInfo *ResourceVersionInfo
 	ReconnectCount      int64
 	IsInitialized       bool
 	InitializedTime     time.Time
@@ -516,6 +769,8 @@ type ResourceWatchState struct {
 	LastHeartbeat       time.Time
 	ConnectionHealthy   bool
 	WatchInterface      watch.Interface
+	WatchStartTime      time.Time
+	LastResourceVersion string
 }
 
 type resourceInfo struct {
@@ -528,6 +783,29 @@ type ResourceVersionInfo struct {
 	Version   string
 	Timestamp time.Time
 	IsStale   bool
+}
+
+func (w *ResourceWatcher) getResourceInfo(key string) (resourceInfo, bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	info, exists := w.watchers[key].InitialResources[key]
+	return info, exists
+}
+
+func (w *ResourceWatcher) setResourceInfo(key string, info resourceInfo) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.watchers[key] != nil {
+		w.watchers[key].InitialResources[key] = info
+	}
+}
+
+func (w *ResourceWatcher) deleteResourceInfo(key string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.watchers[key] != nil {
+		delete(w.watchers[key].InitialResources, key)
+	}
 }
 
 func NewResourceWatcher(config *config.Config, notifier notifier.Notifier) (*ResourceWatcher, error) {
@@ -606,39 +884,52 @@ func NewResourceWatcher(config *config.Config, notifier notifier.Notifier) (*Res
 
 func (w *ResourceWatcher) startEventProcessor() {
 	go func() {
-		batchInterval := 5 * time.Second
-		if w.config.Watcher.EventBatchIntervalMs > 0 {
-			batchInterval = time.Duration(w.config.Watcher.EventBatchIntervalMs) * time.Millisecond
-		}
-
-		ticker := time.NewTicker(batchInterval)
-		defer ticker.Stop()
-
-		var events []*ResourceEvent
 		dedupMap := make(map[string]*ResourceEvent)
+		events := make([]*ResourceEvent, 0, 100)
 		lastNotificationTime := make(map[string]time.Time)
 		notificationCooldown := 30 * time.Second
 		if w.config.Watcher.NotificationCooldown > 0 {
 			notificationCooldown = time.Duration(w.config.Watcher.NotificationCooldown) * time.Second
 		}
 
-		maxBatchSize := 50
-		minBatchInterval := 1 * time.Second
-		maxBatchInterval := 30 * time.Second
-		currentBatchInterval := batchInterval
+		batchInterval := DefaultBatchInterval
+		if w.config.Watcher.EventBatchIntervalMs > 0 {
+			batchInterval = time.Duration(w.config.Watcher.EventBatchIntervalMs) * time.Millisecond
+		}
 
-		cleanupTicker := time.NewTicker(5 * time.Minute)
+		maxBatchSize := DefaultMaxBatchSize
+		if w.config.Watcher.EventBufferSize > 0 {
+			maxBatchSize = w.config.Watcher.EventBufferSize / 2
+		}
+
+		minBatchInterval := DefaultMinBatchInterval
+		maxBatchInterval := DefaultMaxBatchInterval
+
+		currentBatchInterval := batchInterval
+		ticker := time.NewTicker(currentBatchInterval)
+		defer ticker.Stop()
+
+		cleanupTicker := time.NewTicker(DefaultCleanupInterval)
 		defer cleanupTicker.Stop()
 
 		for {
 			select {
 			case <-w.ctx.Done():
+				log.Printf("Event processor shutting down due to context cancellation")
 				return
 			case event := <-w.eventBuffer:
+				if w.ctx.Err() != nil {
+					log.Printf("Event processor shutting down, dropping event")
+					return
+				}
+
 				key := fmt.Sprintf("%s:%s:%s:%s", event.ResourceKind, event.Namespace, event.ResourceName, event.Type)
 				dedupMap[key] = event
+				log.Printf("Received event in buffer: %s %s/%s (buffer size: %d/%d)",
+					event.Type, event.Namespace, event.ResourceName, len(dedupMap), cap(w.eventBuffer))
 
 				if len(dedupMap) >= maxBatchSize {
+					log.Printf("Buffer full, processing batch of %d events", len(dedupMap))
 					events = make([]*ResourceEvent, 0, len(dedupMap))
 					for _, event := range dedupMap {
 						events = append(events, event)
@@ -649,12 +940,16 @@ func (w *ResourceWatcher) startEventProcessor() {
 					}
 
 					w.processEventBatchEnhanced(events, lastNotificationTime, notificationCooldown)
-
 					ticker.Reset(currentBatchInterval)
 				}
 
 			case <-ticker.C:
+				if w.ctx.Err() != nil {
+					return
+				}
+
 				if len(dedupMap) > 0 {
+					log.Printf("Timer triggered, processing batch of %d events", len(dedupMap))
 					events = make([]*ResourceEvent, 0, len(dedupMap))
 					for _, event := range dedupMap {
 						events = append(events, event)
@@ -673,11 +968,16 @@ func (w *ResourceWatcher) startEventProcessor() {
 					} else {
 						currentBatchInterval = batchInterval
 					}
+					log.Printf("Adjusted batch interval to %v (processed %d events)", currentBatchInterval, len(events))
 					ticker.Reset(currentBatchInterval)
+				} else {
+					log.Printf("Timer triggered but no events to process")
 				}
 
 			case <-cleanupTicker.C:
-				// Clean up old notification tracking entries
+				if w.ctx.Err() != nil {
+					return
+				}
 				w.cleanupOldNotificationEntries(lastNotificationTime, notificationCooldown)
 			}
 		}
@@ -710,17 +1010,20 @@ func (w *ResourceWatcher) processEventBatchEnhanced(events []*ResourceEvent, las
 		}
 	}
 
+	log.Printf("Event priority breakdown - High: %d, Medium: %d, Low: %d", len(highPriority), len(mediumPriority), len(lowPriority))
+
 	notificationsSent := 0
 	correlatedEvents := make(map[string][]*ResourceEvent)
 
-	// Group events by correlation
 	for _, event := range events {
 		correlationKey := event.CorrelationID
 		correlatedEvents[correlationKey] = append(correlatedEvents[correlationKey], event)
 	}
 
-	// Process correlated events
-	for _, correlatedGroup := range correlatedEvents {
+	log.Printf("Processing %d correlated event groups", len(correlatedEvents))
+
+	for correlationKey, correlatedGroup := range correlatedEvents {
+		log.Printf("Processing correlation group %s with %d events", correlationKey, len(correlatedGroup))
 		if len(correlatedGroup) == 1 {
 			event := correlatedGroup[0]
 			notificationsSent += w.processSingleEvent(event, lastNotificationTime, notificationCooldown)
@@ -734,6 +1037,8 @@ func (w *ResourceWatcher) processEventBatchEnhanced(events []*ResourceEvent, las
 
 	if notificationsSent > 0 {
 		log.Printf("Sent %d notifications from enhanced batch of %d events", notificationsSent, len(events))
+	} else {
+		log.Printf("No notifications sent from batch of %d events", len(events))
 	}
 }
 
@@ -747,6 +1052,9 @@ func (w *ResourceWatcher) processSingleEvent(event *ResourceEvent, lastNotificat
 		now := time.Now()
 
 		if lastTime, exists := lastNotificationTime[resourceKey]; !exists || now.Sub(lastTime) >= notificationCooldown {
+			log.Printf("Sending notification for %s %s/%s (cooldown: %v)",
+				event.Type, event.Namespace, event.ResourceName, notificationCooldown)
+
 			notificationEvent := notifier.NotificationEvent{
 				EventType:    string(event.Type),
 				ResourceKind: event.ResourceKind,
@@ -760,12 +1068,18 @@ func (w *ResourceWatcher) processSingleEvent(event *ResourceEvent, lastNotificat
 				return 0
 			} else {
 				lastNotificationTime[resourceKey] = now
+				log.Printf("Successfully sent notification for %s %s/%s",
+					event.Type, event.Namespace, event.ResourceName)
 				return 1
 			}
 		} else {
-			log.Printf("Skipping notification for %s %s/%s due to cooldown (last notification: %v ago)",
-				event.Type, event.Namespace, event.ResourceName, now.Sub(lastTime))
+			timeSinceLast := now.Sub(lastTime)
+			log.Printf("Skipping notification for %s %s/%s due to cooldown (last notification: %v ago, cooldown: %v, remaining: %v)",
+				event.Type, event.Namespace, event.ResourceName, timeSinceLast, notificationCooldown, notificationCooldown-timeSinceLast)
 		}
+	} else {
+		log.Printf("No notifier configured, skipping notification for %s %s/%s",
+			event.Type, event.Namespace, event.ResourceName)
 	}
 
 	return 0
@@ -887,18 +1201,23 @@ func (w *ResourceWatcher) Start(startupCtx context.Context) error {
 
 // Stop gracefully stops all watchers
 func (w *ResourceWatcher) Stop() {
+	log.Printf("Stopping resource watcher...")
 	w.cancel()
 
-	// Clean up all watchers
+	if w.frequencyTracker != nil {
+		w.frequencyTracker.Stop()
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	for key, watchState := range w.watchers {
+	for _, watchState := range w.watchers {
 		if watchState.WatchInterface != nil {
 			watchState.WatchInterface.Stop()
 		}
-		delete(w.watchers, key)
 	}
+
+	log.Printf("Resource watcher stopped")
 }
 
 // GetMetrics returns a copy of the current metrics
@@ -1480,23 +1799,20 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 				shouldNotify := false
 				if !resourceCreationTime.IsZero() {
 					timeSinceCreation := time.Since(resourceCreationTime.Time)
-					if timeSinceCreation < timeSinceWatchStart+30*time.Second {
+					if timeSinceCreation < timeSinceWatchStart+DefaultResourceCreationDelay {
 						shouldNotify = true
 					}
 				} else {
-					shouldNotify = timeSinceWatchStart > 30*time.Second
+					shouldNotify = timeSinceWatchStart > DefaultResourceCreationDelay
 				}
 
 				if shouldNotify {
-					log.Printf("[%s] New resource %s/%s was ADDED by %s",
+					log.Printf("[%s] New resource %s/%s was ADDED by %s - BYPASSING COOLDOWN (ADD events always notify)",
 						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
-					select {
-					case w.eventBuffer <- resourceEvent:
+					if w.queueEventWithBackpressure(resourceEvent) {
 						eventProcessed = true
 						w.metrics.EventsBatched++
-					default:
-						log.Printf("Event buffer full, dropping ADDED event for %s/%s", metadata.GetNamespace(), metadata.GetName())
-						w.metrics.EventsDropped++
+						log.Printf("[%s] Successfully queued ADD notification for %s/%s", resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
 					}
 				} else {
 					log.Printf("[%s] Resource %s/%s discovered during initial load (no notification sent)",
@@ -1504,21 +1820,22 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 				}
 			}
 
-			watchState.InitialResources[key] = resourceInfo{
+			w.setResourceInfo(key, resourceInfo{
 				version:  metadata.GetResourceVersion(),
 				lastSeen: time.Now(),
 				object:   obj.DeepCopy(),
-			}
+			})
 
 		case "MODIFIED":
-			if timeSinceStart := time.Since(watchStartTime); timeSinceStart > 30*time.Second {
+			if timeSinceStart := time.Since(watchStartTime); timeSinceStart > DefaultWatchStartupDelay {
 				if existingInfo, exists := watchState.InitialResources[key]; exists {
 					if existingInfo.version != metadata.GetResourceVersion() {
 						shouldNotify := true
 						if existingInfo.object != nil {
-							// Store the old object for comparison before updating it
 							oldObject := existingInfo.object
+							log.Printf("[%s] Checking if change in %s/%s should trigger notification", resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
 							shouldNotify = w.shouldNotifyForChange(resourceConfig.Kind, oldObject, obj)
+							log.Printf("[%s] shouldNotifyForChange returned: %v for %s/%s", resourceConfig.Kind, shouldNotify, metadata.GetNamespace(), metadata.GetName())
 						}
 
 						if shouldNotify {
@@ -1526,7 +1843,9 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 							w.frequencyTracker.recordEvent(resourceKey)
 							eventFrequency := w.frequencyTracker.getEventFrequency(resourceKey)
 
-							baseCooldown := 10 * time.Second
+							// IMPORTANT: Bypass cooldown for important field changes
+							// This ensures critical changes are always notified
+							baseCooldown := DefaultBaseCooldown
 							if w.config.Watcher.ModificationCooldown > 0 {
 								baseCooldown = time.Duration(w.config.Watcher.ModificationCooldown) * time.Second
 							}
@@ -1535,23 +1854,38 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 
 							timeSinceLastModification := time.Since(existingInfo.lastSeen)
 
-							if timeSinceLastModification >= adaptiveCooldown {
-								log.Printf("[%s] Resource %s/%s was MODIFIED by %s (version: %s -> %s, frequency: %.1f/min, cooldown: %v)",
+
+							hasImportantFieldsChanged := w.hasImportantFieldsChanged(resourceConfig.Kind, existingInfo.object, obj)
+
+							if hasImportantFieldsChanged {
+								// IMPORTANT FIELD CHANGE: Bypass cooldown and always notify
+								log.Printf("[%s] Resource %s/%s IMPORTANT FIELDS CHANGED by %s (version: %s -> %s) - BYPASSING COOLDOWN - SENDING NOTIFICATION",
+									resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user,
+									existingInfo.version, metadata.GetResourceVersion())
+
+								w.eventCorrelator.addEvent(resourceEvent)
+
+								if w.queueEventWithBackpressure(resourceEvent) {
+									eventProcessed = true
+									w.metrics.EventsBatched++
+									log.Printf("[%s] Successfully queued notification for IMPORTANT field change in %s/%s", resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
+								}
+							} else if timeSinceLastModification >= adaptiveCooldown {
+								// NON-IMPORTANT FIELD CHANGE: Apply cooldown to prevent spam
+								log.Printf("[%s] Resource %s/%s was MODIFIED (non-important fields) by %s (version: %s -> %s, frequency: %.1f/min, cooldown: %v) - SENDING NOTIFICATION",
 									resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user,
 									existingInfo.version, metadata.GetResourceVersion(), eventFrequency, adaptiveCooldown)
 
 								w.eventCorrelator.addEvent(resourceEvent)
 
-								select {
-								case w.eventBuffer <- resourceEvent:
+								if w.queueEventWithBackpressure(resourceEvent) {
 									eventProcessed = true
 									w.metrics.EventsBatched++
-								default:
-									log.Printf("Event buffer full, dropping MODIFIED event for %s/%s", metadata.GetNamespace(), metadata.GetName())
-									w.metrics.EventsDropped++
+									log.Printf("[%s] Successfully queued notification for %s/%s", resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
 								}
 							} else {
-								log.Printf("[%s] Skipping MODIFIED event for %s/%s (last modification was %v ago, adaptive cooldown: %v)",
+								// NON-IMPORTANT FIELD CHANGE: Cooldown still active, skip notification
+								log.Printf("[%s] Skipping MODIFIED event for %s/%s (non-important fields, last modification was %v ago, adaptive cooldown: %v)",
 									resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), timeSinceLastModification, adaptiveCooldown)
 								w.metrics.EventsSkipped++
 							}
@@ -1567,38 +1901,30 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 
 					w.eventCorrelator.addEvent(resourceEvent)
 
-					select {
-					case w.eventBuffer <- resourceEvent:
+					if w.queueEventWithBackpressure(resourceEvent) {
 						eventProcessed = true
 						w.metrics.EventsBatched++
-					default:
-						log.Printf("Event buffer full, dropping MODIFIED event for %s/%s", metadata.GetNamespace(), metadata.GetName())
-						w.metrics.EventsDropped++
 					}
 				}
 			}
 
-			// Update the stored object AFTER processing the event
-			watchState.InitialResources[key] = resourceInfo{
+			w.setResourceInfo(key, resourceInfo{
 				version:  metadata.GetResourceVersion(),
 				lastSeen: time.Now(),
 				object:   obj.DeepCopy(),
-			}
+			})
 
 		case "DELETED":
-			if timeSinceStart := time.Since(watchStartTime); timeSinceStart > 30*time.Second {
-				log.Printf("[%s] Resource %s/%s was DELETED by %s",
+			if timeSinceStart := time.Since(watchStartTime); timeSinceStart > DefaultWatchStartupDelay {
+				log.Printf("[%s] Resource %s/%s was DELETED by %s - BYPASSING COOLDOWN (DELETE events always notify)",
 					resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
-				select {
-				case w.eventBuffer <- resourceEvent:
+				if w.queueEventWithBackpressure(resourceEvent) {
 					eventProcessed = true
 					w.metrics.EventsBatched++
-				default:
-					log.Printf("Event buffer full, dropping DELETED event for %s/%s", metadata.GetNamespace(), metadata.GetName())
-					w.metrics.EventsDropped++
+					log.Printf("[%s] Successfully queued DELETE notification for %s/%s", resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
 				}
 			}
-			delete(watchState.InitialResources, key)
+			w.deleteResourceInfo(key)
 
 		default:
 			log.Printf("Skipping unknown event type: %s", event.Type)
@@ -1609,4 +1935,28 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 			w.eventHandler(resourceEvent)
 		}
 	}
+}
+
+func (w *ResourceWatcher) queueEventWithBackpressure(event *ResourceEvent) bool {
+	select {
+	case w.eventBuffer <- event:
+		return true
+	default:
+		if w.isHighPriorityEvent(event) {
+			w.handleBufferOverflow(event)
+			return true
+		}
+		log.Printf("Event buffer full, dropping %s event for %s/%s", event.Type, event.Namespace, event.ResourceName)
+		w.metrics.EventsDropped++
+		return false
+	}
+}
+
+func (w *ResourceWatcher) isHighPriorityEvent(event *ResourceEvent) bool {
+	return event.Type == "DELETED" || event.Priority == PriorityHigh
+}
+
+func (w *ResourceWatcher) handleBufferOverflow(event *ResourceEvent) {
+	log.Printf("Buffer overflow, processing high-priority event immediately: %s %s/%s", event.Type, event.Namespace, event.ResourceName)
+	w.processSingleEvent(event, make(map[string]time.Time), 0)
 }
