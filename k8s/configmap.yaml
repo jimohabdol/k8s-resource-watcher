@@ -5,21 +5,24 @@ metadata:
   namespace: default
 data:
   config.yaml: |
-    clusterName: "my-cluster"  # Name of your Kubernetes cluster
+    clusterName: "test-cluster"
 
-    # Watcher configuration (optional)
+    # Watcher configuration
     watcher:
-      watchTimeoutSeconds: 900    # 15 minutes - longer for production
-      maxReconnects: 3            # Fewer reconnects with keep-alive
-      reconnectBackoffMs: 3000    # Faster reconnection
-      heartbeatIntervalMs: 60000  # 1 minute - less frequent
-      keepAliveEnabled: true     # Enable keep-alive functionality
+      watchTimeoutSeconds: 180
+      maxReconnects: 3
+      reconnectBackoffMs: 3000
+      heartbeatIntervalMs: 15000
+      keepAliveEnabled: true
       
-      # Advanced optimizations for production environments
-      eventBatchIntervalMs: 5000    # Process events every 5 seconds
-      eventBufferSize: 100          # Buffer up to 100 events
-      maxConcurrentWatches: 5       # Maximum 5 concurrent watchers
-      resourceVersionTTL: 3600      # Resource version TTL: 1 hour
+      # Advanced optimizations
+      eventBatchIntervalMs: 2000
+      eventBufferSize: 200
+      maxConcurrentWatches: 10
+      resourceVersionTTL: 3600
+      notificationCooldown: 15
+      maxBatchSize: 100
+      cleanupInterval: 300
       
       # Deployment monitoring configuration
       deploymentImportantFields:
@@ -32,46 +35,29 @@ data:
         - "securityContext"
         - "imagePullSecrets"
         - "hostAliases"
-        # Note: replicas, strategy, and other fields are intentionally excluded
 
     resources:
-      # Watch all ConfigMaps in the dev namespace
-      - kind: ConfigMap
-        namespace: dev
-      
-      # Watch a specific ConfigMap in the dev namespace
-      - kind: ConfigMap
-        namespace: dev
-        resourceName: dev-config
-      
-      # Watch all Deployments in the prod namespace
+      # Watch all Deployments in the default namespace
       - kind: Deployment
-        namespace: prod
+        namespace: default
       
-      # Watch a specific Deployment in the prod namespace
-      - kind: Deployment
-        namespace: prod
-        resourceName: api-server
+      # Watch all ConfigMaps in the default namespace
+      - kind: ConfigMap
+        namespace: default
+      
+      # Watch all Secrets in the default namespace
+      - kind: Secret
+        namespace: default
+      
+      # Watch all Ingresses in the default namespace
       - kind: Ingress
-        namespace: prod
-        resourceName: api-server
+        namespace: default
 
     email:
       smtpHost: ""
       smtpPort: 587
-      useAuth: true
-      # Credentials will be loaded from environment variables (set by secretKeyRef)
-      smtpUsername: ""  # Will be overridden by SMTP_USERNAME env var
-      smtpPassword: ""  # Will be overridden by SMTP_PASSWORD env var
-      fromEmail: ""     # Will be overridden by FROM_EMAIL env var
-      toEmails: []      # Will be overridden by TO_EMAILS env var
-
-    # Example with authentication enabled:
-    # email:
-    #   smtpHost: "smtp.gmail.com"
-    #   smtpPort: 587  # TLS port
-    #   useAuth: true
-    #   smtpUsername: "your-email@gmail.com"  # Will be loaded from secret
-    #   smtpPassword: "your-app-specific-password"  # Will be loaded from secret
-    #   fromEmail: "your-email@gmail.com"  # Will be loaded from secret
-    #   toEmail: "recipient@example.com"  # Will be loaded from secret 
+      useAuth: false
+      smtpUsername: ""
+      smtpPassword: ""
+      fromEmail: ""
+      toEmails: [] 

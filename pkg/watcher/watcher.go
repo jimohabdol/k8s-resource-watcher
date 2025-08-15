@@ -44,6 +44,12 @@ type ResourceWatcher struct {
 	adaptiveCooldown *AdaptiveCooldown
 	eventCorrelator  *EventCorrelator
 	priorityQueue    *PriorityQueue
+
+	// Rollout tracking to group related deployment changes
+	rolloutTracker *RolloutTracker
+
+	// Persistent resource state management
+	resourceStateManager *ResourceStateManager
 }
 
 // WatcherMetrics tracks watcher statistics
@@ -459,7 +465,7 @@ func (w *ResourceWatcher) hasDeploymentImportantFieldsChanged(oldObj, newObj *un
 
 	if oldObj.Object == nil || newObj.Object == nil {
 		log.Printf("Warning: nil Object field in unstructured object")
-		return false
+		return true
 	}
 
 	oldSpec, oldExists := oldObj.Object["spec"].(map[string]interface{})
@@ -487,44 +493,17 @@ func (w *ResourceWatcher) hasDeploymentImportantFieldsChanged(oldObj, newObj *un
 	}
 
 	importantFields := w.config.Watcher.GetDeploymentImportantFields()
-	if len(importantFields) == 0 {
-		log.Printf("Warning: No deployment important fields configured, using defaults")
-		importantFields = []string{"containers", "volumes", "serviceAccountName", "nodeSelector", "affinity", "tolerations", "securityContext", "imagePullSecrets", "hostAliases", "env"}
-	}
 
-	log.Printf("Checking %d important fields for deployment changes: %v", len(importantFields), importantFields)
-
+	// Only check the fields specified in config - no hardcoded defaults
 	for _, field := range importantFields {
-		log.Printf("Checking field '%s' for changes", field)
 		if w.hasFieldChanged(oldTemplateSpec, newTemplateSpec, field) {
 			log.Printf("Deployment important field '%s' changed - NOTIFICATION TRIGGERED", field)
 			return true
 		}
-		log.Printf("Field '%s' unchanged", field)
 	}
 
-	oldStrategy := oldSpec["strategy"]
-	newStrategy := newSpec["strategy"]
-	if !reflect.DeepEqual(oldStrategy, newStrategy) {
-		log.Printf("Deployment strategy changed - NOTIFICATION TRIGGERED")
-		return true
-	}
+	// No hardcoded field checks - only config-specified fields matter
 
-	oldReplicas := oldSpec["replicas"]
-	newReplicas := newSpec["replicas"]
-	if !reflect.DeepEqual(oldReplicas, newReplicas) {
-		log.Printf("Deployment replicas changed - NOTIFICATION TRIGGERED")
-		return true
-	}
-
-	oldSelector := oldSpec["selector"]
-	newSelector := newSpec["selector"]
-	if !reflect.DeepEqual(oldSelector, newSelector) {
-		log.Printf("Deployment selector changed - NOTIFICATION TRIGGERED")
-		return true
-	}
-
-	log.Printf("Deployment change detected but no important fields modified - likely status change (pod restart)")
 	return false
 }
 
@@ -583,38 +562,10 @@ func (w *ResourceWatcher) hasFieldChanged(oldSpec, newSpec map[string]interface{
 		return false
 	}
 
-	switch fieldName {
-	case "containers":
-		return w.hasContainersChanged(oldSpec, newSpec)
-	case "volumes":
-		return w.hasVolumesChanged(oldSpec, newSpec)
-	case "env":
-		return w.hasEnvChanged(oldSpec, newSpec)
-	case "imagePullSecrets":
-		return w.hasImagePullSecretsChanged(oldSpec, newSpec)
-	case "nodeSelector":
-		return w.hasNodeSelectorChanged(oldSpec, newSpec)
-	case "affinity":
-		return w.hasAffinityChanged(oldSpec, newSpec)
-	case "tolerations":
-		return w.hasTolerationsChanged(oldSpec, newSpec)
-	case "serviceAccountName":
-		oldValue := oldSpec["serviceAccountName"]
-		newValue := newSpec["serviceAccountName"]
-		return !reflect.DeepEqual(oldValue, newValue)
-	case "securityContext":
-		oldValue := oldSpec["securityContext"]
-		newValue := newSpec["securityContext"]
-		return !reflect.DeepEqual(oldValue, newValue)
-	case "hostAliases":
-		oldValue := oldSpec["hostAliases"]
-		newValue := newSpec["hostAliases"]
-		return !reflect.DeepEqual(oldValue, newValue)
-	default:
-		oldValue := oldSpec[fieldName]
-		newValue := newSpec[fieldName]
-		return !reflect.DeepEqual(oldValue, newValue)
-	}
+	// Dynamic field change detection - no hardcoded field names
+	oldValue := oldSpec[fieldName]
+	newValue := newSpec[fieldName]
+	return !reflect.DeepEqual(oldValue, newValue)
 }
 
 // hasContainerHostAliasesChanged checks if container hostAliases have changed
@@ -869,10 +820,12 @@ func NewResourceWatcher(config *config.Config, notifier notifier.Notifier) (*Res
 		semaphore:   make(chan struct{}, semaphoreCapacity),
 		eventBuffer: make(chan *ResourceEvent, bufferSize),
 
-		frequencyTracker: newEventFrequencyTracker(),
-		adaptiveCooldown: newAdaptiveCooldown(10 * time.Second),
-		eventCorrelator:  newEventCorrelator(),
-		priorityQueue:    newPriorityQueue(),
+		frequencyTracker:     newEventFrequencyTracker(),
+		adaptiveCooldown:     newAdaptiveCooldown(10 * time.Second),
+		eventCorrelator:      newEventCorrelator(),
+		priorityQueue:        newPriorityQueue(),
+		rolloutTracker:       newRolloutTracker(notifier),
+		resourceStateManager: NewResourceStateManager(),
 	}
 
 	watcher.eventHandler = func(event *ResourceEvent) {
@@ -1207,6 +1160,9 @@ func (w *ResourceWatcher) Stop() {
 	if w.frequencyTracker != nil {
 		w.frequencyTracker.Stop()
 	}
+	if w.rolloutTracker != nil {
+		w.rolloutTracker.Stop()
+	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1238,7 +1194,6 @@ func (w *ResourceWatcher) GetWatcherState() map[string]*ResourceWatchState {
 }
 
 func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig config.ResourceConfig, startupCtx context.Context) {
-	// Create a unique key for this watcher
 	watcherKey := fmt.Sprintf("%s/%s/%s", resourceConfig.Kind, resourceConfig.Namespace, resourceConfig.ResourceName)
 
 	gvr := GetGroupVersionResource(resourceConfig.Kind)
@@ -1256,7 +1211,7 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 	}
 
 	watchState := &ResourceWatchState{
-		InitialResources:    make(map[string]resourceInfo),
+		InitialResources:    w.resourceStateManager.GetWatcherState(watcherKey),
 		IsInitialized:       false,
 		LastSuccessfulWatch: time.Now(),
 		LastHeartbeat:       time.Now(),
@@ -1267,12 +1222,12 @@ func (w *ResourceWatcher) watchResource(ctx context.Context, resourceConfig conf
 	w.watchers[watcherKey] = watchState
 	w.mu.Unlock()
 
-	// Ensure cleanup on exit
 	defer func() {
 		w.mu.Lock()
 		if watchState.WatchInterface != nil {
 			watchState.WatchInterface.Stop()
 		}
+		w.resourceStateManager.SetWatcherState(watcherKey, watchState.InitialResources)
 		delete(w.watchers, watcherKey)
 		w.mu.Unlock()
 		log.Printf("Cleaned up watcher for %s", watcherKey)
@@ -1420,6 +1375,16 @@ func (w *ResourceWatcher) loadInitialResources(ctx context.Context, resourceConf
 				continue
 			}
 			key := fmt.Sprintf("%s/%s", metadata.GetNamespace(), metadata.GetName())
+
+			if existingInfo, exists := watchState.InitialResources[key]; exists {
+				if existingInfo.version >= metadata.GetResourceVersion() {
+					log.Printf("Keeping existing state for %s/%s (existing: %s, current: %s)",
+						metadata.GetNamespace(), metadata.GetName(), existingInfo.version, metadata.GetResourceVersion())
+					continue
+				}
+			}
+
+			// Update with new state
 			watchState.InitialResources[key] = resourceInfo{
 				version:  metadata.GetResourceVersion(),
 				lastSeen: time.Now(),
@@ -1503,6 +1468,8 @@ func (w *ResourceWatcher) startBackgroundGoroutines(ctx context.Context, resourc
 }
 
 func (w *ResourceWatcher) runWatchLoop(ctx context.Context, resourceConfig config.ResourceConfig, gvr schema.GroupVersionResource, watchState *ResourceWatchState, lastResourceVersion string, processedEvents map[string]time.Time, watchStartTime time.Time) {
+	watcherKey := fmt.Sprintf("%s/%s/%s", resourceConfig.Kind, resourceConfig.Namespace, resourceConfig.ResourceName)
+
 	backoff := wait.Backoff{
 		Steps:    10,
 		Duration: 1 * time.Second,
@@ -1573,7 +1540,6 @@ func (w *ResourceWatcher) runWatchLoop(ctx context.Context, resourceConfig confi
 					resourceConfig.Kind, resourceConfig.Namespace)
 				lastResourceVersion = ""
 				watchState.ReconnectCount = 0
-				watchState.InitialResources = make(map[string]resourceInfo)
 				watchState.IsInitialized = false
 				watchState.ConsecutiveFailures = 0
 				watchState.ResourceVersionInfo = nil
@@ -1600,7 +1566,7 @@ func (w *ResourceWatcher) runWatchLoop(ctx context.Context, resourceConfig confi
 		log.Printf("Watch connection established successfully for %s in namespace %s",
 			resourceConfig.Kind, resourceConfig.Namespace)
 
-		w.processWatchEvents(ctx, resourceConfig, watch, watchState, lastResourceVersion, processedEvents, watchStartTime)
+		w.processWatchEvents(ctx, resourceConfig, watch, watchState, lastResourceVersion, processedEvents, watchStartTime, watcherKey)
 
 		watchState.ReconnectCount++
 		w.metrics.WatchReconnects++
@@ -1621,7 +1587,6 @@ func (w *ResourceWatcher) runWatchLoop(ctx context.Context, resourceConfig confi
 		if watchState.ReconnectCount > 5 {
 			log.Printf("Too many reconnects (%d), resetting state", watchState.ReconnectCount)
 			lastResourceVersion = ""
-			watchState.InitialResources = make(map[string]resourceInfo)
 			watchState.IsInitialized = false
 			watchState.ReconnectCount = 0
 			watchState.ConsecutiveFailures = 0
@@ -1675,7 +1640,7 @@ func GetGroupVersionResource(kind string) schema.GroupVersionResource {
 	}
 }
 
-func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig config.ResourceConfig, watch watch.Interface, watchState *ResourceWatchState, lastResourceVersion string, processedEvents map[string]time.Time, watchStartTime time.Time) {
+func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig config.ResourceConfig, watch watch.Interface, watchState *ResourceWatchState, lastResourceVersion string, processedEvents map[string]time.Time, watchStartTime time.Time, watcherKey string) {
 	for event := range watch.ResultChan() {
 		select {
 		case <-ctx.Done():
@@ -1820,11 +1785,17 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 				}
 			}
 
-			w.setResourceInfo(key, resourceInfo{
+			w.resourceStateManager.SetResourceInfo(watcherKey, key, resourceInfo{
 				version:  metadata.GetResourceVersion(),
 				lastSeen: time.Now(),
 				object:   obj.DeepCopy(),
 			})
+
+			watchState.InitialResources[key] = resourceInfo{
+				version:  metadata.GetResourceVersion(),
+				lastSeen: time.Now(),
+				object:   obj.DeepCopy(),
+			}
 
 		case "MODIFIED":
 			if timeSinceStart := time.Since(watchStartTime); timeSinceStart > DefaultWatchStartupDelay {
@@ -1843,8 +1814,6 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 							w.frequencyTracker.recordEvent(resourceKey)
 							eventFrequency := w.frequencyTracker.getEventFrequency(resourceKey)
 
-							// IMPORTANT: Bypass cooldown for important field changes
-							// This ensures critical changes are always notified
 							baseCooldown := DefaultBaseCooldown
 							if w.config.Watcher.ModificationCooldown > 0 {
 								baseCooldown = time.Duration(w.config.Watcher.ModificationCooldown) * time.Second
@@ -1854,22 +1823,19 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 
 							timeSinceLastModification := time.Since(existingInfo.lastSeen)
 
-
 							hasImportantFieldsChanged := w.hasImportantFieldsChanged(resourceConfig.Kind, existingInfo.object, obj)
 
 							if hasImportantFieldsChanged {
-								// IMPORTANT FIELD CHANGE: Bypass cooldown and always notify
-								log.Printf("[%s] Resource %s/%s IMPORTANT FIELDS CHANGED by %s (version: %s -> %s) - BYPASSING COOLDOWN - SENDING NOTIFICATION",
+								if resourceConfig.Kind == "Deployment" {
+									w.rolloutTracker.trackDeploymentChange(resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), existingInfo.version, metadata.GetResourceVersion())
+								}
+								log.Printf("[%s] Resource %s/%s IMPORTANT FIELDS CHANGED by %s (version: %s -> %s) - ROLLOUT IN PROGRESS, LOGGING FOR AUDIT",
 									resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user,
 									existingInfo.version, metadata.GetResourceVersion())
 
-								w.eventCorrelator.addEvent(resourceEvent)
-
-								if w.queueEventWithBackpressure(resourceEvent) {
-									eventProcessed = true
-									w.metrics.EventsBatched++
-									log.Printf("[%s] Successfully queued notification for IMPORTANT field change in %s/%s", resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
-								}
+								w.metrics.EventsSkipped++
+								log.Printf("[%s] Skipping individual notification for %s/%s - will notify when rollout completes",
+									resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
 							} else if timeSinceLastModification >= adaptiveCooldown {
 								// NON-IMPORTANT FIELD CHANGE: Apply cooldown to prevent spam
 								log.Printf("[%s] Resource %s/%s was MODIFIED (non-important fields) by %s (version: %s -> %s, frequency: %.1f/min, cooldown: %v) - SENDING NOTIFICATION",
@@ -1884,7 +1850,6 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 									log.Printf("[%s] Successfully queued notification for %s/%s", resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
 								}
 							} else {
-								// NON-IMPORTANT FIELD CHANGE: Cooldown still active, skip notification
 								log.Printf("[%s] Skipping MODIFIED event for %s/%s (non-important fields, last modification was %v ago, adaptive cooldown: %v)",
 									resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), timeSinceLastModification, adaptiveCooldown)
 								w.metrics.EventsSkipped++
@@ -1896,23 +1861,46 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 						}
 					}
 				} else {
-					log.Printf("[%s] Resource %s/%s was MODIFIED (new resource) by %s",
-						resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
+					if resourceConfig.Kind == "Deployment" {
+						log.Printf("[%s] Resource %s/%s was MODIFIED (new resource) by %s - checking for rollout tracking",
+							resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 
-					w.eventCorrelator.addEvent(resourceEvent)
-
-					if w.queueEventWithBackpressure(resourceEvent) {
-						eventProcessed = true
-						w.metrics.EventsBatched++
+						hasImportantFieldsChanged := w.hasImportantFieldsChanged(resourceConfig.Kind, nil, obj)
+						if hasImportantFieldsChanged {
+							log.Printf("[%s] Resource %s/%s IMPORTANT FIELDS CHANGED (new resource) - ROLLOUT IN PROGRESS, LOGGING FOR AUDIT",
+								resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
+							w.metrics.EventsSkipped++
+						} else {
+							log.Printf("[%s] Resource %s/%s NON-IMPORTANT FIELDS CHANGED (new resource) - SENDING NOTIFICATION",
+								resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
+							w.eventCorrelator.addEvent(resourceEvent)
+							if w.queueEventWithBackpressure(resourceEvent) {
+								eventProcessed = true
+								w.metrics.EventsBatched++
+							}
+						}
+					} else {
+						log.Printf("[%s] Resource %s/%s was MODIFIED (new resource) by %s",
+							resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
+						w.eventCorrelator.addEvent(resourceEvent)
+						if w.queueEventWithBackpressure(resourceEvent) {
+							eventProcessed = true
+							w.metrics.EventsBatched++
+						}
 					}
 				}
 			}
 
-			w.setResourceInfo(key, resourceInfo{
+			w.resourceStateManager.SetResourceInfo(watcherKey, key, resourceInfo{
 				version:  metadata.GetResourceVersion(),
 				lastSeen: time.Now(),
 				object:   obj.DeepCopy(),
 			})
+			watchState.InitialResources[key] = resourceInfo{
+				version:  metadata.GetResourceVersion(),
+				lastSeen: time.Now(),
+				object:   obj.DeepCopy(),
+			}
 
 		case "DELETED":
 			if timeSinceStart := time.Since(watchStartTime); timeSinceStart > DefaultWatchStartupDelay {
@@ -1924,7 +1912,8 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 					log.Printf("[%s] Successfully queued DELETE notification for %s/%s", resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
 				}
 			}
-			w.deleteResourceInfo(key)
+			w.resourceStateManager.DeleteResourceInfo(watcherKey, key)
+			delete(watchState.InitialResources, key)
 
 		default:
 			log.Printf("Skipping unknown event type: %s", event.Type)
@@ -1959,4 +1948,443 @@ func (w *ResourceWatcher) isHighPriorityEvent(event *ResourceEvent) bool {
 func (w *ResourceWatcher) handleBufferOverflow(event *ResourceEvent) {
 	log.Printf("Buffer overflow, processing high-priority event immediately: %s %s/%s", event.Type, event.Namespace, event.ResourceName)
 	w.processSingleEvent(event, make(map[string]time.Time), 0)
+}
+
+type ChangeTracker struct {
+	mu            sync.RWMutex
+	recentChanges map[string]*ChangeRecord
+	changeWindow  time.Duration
+	cleanupTicker *time.Ticker
+	stopChan      chan struct{}
+}
+
+type ChangeRecord struct {
+	ResourceKey      string
+	OldVersion       string
+	NewVersion       string
+	ChangeType       string
+	LastChangeTime   time.Time
+	NotificationSent bool
+}
+
+func newChangeTracker() *ChangeTracker {
+	tracker := &ChangeTracker{
+		recentChanges: make(map[string]*ChangeRecord),
+		changeWindow:  30 * time.Second,
+		stopChan:      make(chan struct{}),
+	}
+	tracker.startCleanup()
+	return tracker
+}
+
+func (ct *ChangeTracker) startCleanup() {
+	ct.cleanupTicker = time.NewTicker(5 * time.Minute)
+	go func() {
+		for {
+			select {
+			case <-ct.cleanupTicker.C:
+				ct.cleanup()
+			case <-ct.stopChan:
+				ct.cleanupTicker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+func (ct *ChangeTracker) cleanup() {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	cutoff := time.Now().Add(-ct.changeWindow)
+	for key, record := range ct.recentChanges {
+		if record.LastChangeTime.Before(cutoff) {
+			delete(ct.recentChanges, key)
+		}
+	}
+}
+
+func (ct *ChangeTracker) Stop() {
+	close(ct.stopChan)
+}
+
+func (ct *ChangeTracker) isDuplicateChange(resourceKey, oldVersion, newVersion, changeType string) bool {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	key := fmt.Sprintf("%s:%s", resourceKey, changeType)
+	record, exists := ct.recentChanges[key]
+
+	if !exists {
+		ct.recentChanges[key] = &ChangeRecord{
+			ResourceKey:      resourceKey,
+			OldVersion:       oldVersion,
+			NewVersion:       newVersion,
+			ChangeType:       changeType,
+			LastChangeTime:   time.Now(),
+			NotificationSent: false,
+		}
+		return false
+	}
+
+	if record.OldVersion == oldVersion {
+		record.NewVersion = newVersion
+		record.LastChangeTime = time.Now()
+		return true
+	}
+
+	ct.recentChanges[key] = &ChangeRecord{
+		ResourceKey:      resourceKey,
+		OldVersion:       oldVersion,
+		NewVersion:       newVersion,
+		ChangeType:       changeType,
+		LastChangeTime:   time.Now(),
+		NotificationSent: false,
+	}
+	return false
+}
+
+type RolloutTracker struct {
+	mu                 sync.RWMutex
+	activeRollouts     map[string]*RolloutRecord
+	rolloutWindow      time.Duration
+	cleanupTicker      *time.Ticker
+	stopChan           chan struct{}
+	notifier           notifier.Notifier
+	notificationWorker chan *notificationTask
+	workerCtx          context.Context
+	workerCancel       context.CancelFunc
+}
+
+type RolloutRecord struct {
+	DeploymentKey    string
+	StartTime        time.Time
+	OldVersion       string
+	LatestVersion    string
+	ChangeCount      int
+	NotificationSent bool
+	LastUpdateTime   time.Time
+	lastEventTime    time.Time
+	completionTimer  *time.Timer
+}
+
+type notificationTask struct {
+	event  *ResourceEvent
+	record *RolloutRecord
+}
+
+func newRolloutTracker(notifier notifier.Notifier) *RolloutTracker {
+	ctx, cancel := context.WithCancel(context.Background())
+	tracker := &RolloutTracker{
+		activeRollouts:     make(map[string]*RolloutRecord),
+		rolloutWindow:      30 * time.Minute,
+		stopChan:           make(chan struct{}),
+		notifier:           notifier,
+		notificationWorker: make(chan *notificationTask, 100),
+		workerCtx:          ctx,
+		workerCancel:       cancel,
+	}
+	tracker.startCleanup()
+	tracker.startNotificationWorker()
+	return tracker
+}
+
+func (rt *RolloutTracker) startNotificationWorker() {
+	for i := 0; i < 5; i++ {
+		go rt.notificationWorkerLoop()
+	}
+}
+
+func (rt *RolloutTracker) notificationWorkerLoop() {
+	for {
+		select {
+		case task := <-rt.notificationWorker:
+			if task != nil {
+				if err := rt.sendRolloutNotification(task.event, task.record); err != nil {
+					log.Printf("Error sending rollout completion notification for %s: %v",
+						task.record.DeploymentKey, err)
+				} else {
+					log.Printf("Successfully sent rollout completion notification for %s",
+						task.record.DeploymentKey)
+				}
+			}
+		case <-rt.workerCtx.Done():
+			return
+		}
+	}
+}
+
+func (rt *RolloutTracker) startCleanup() {
+	rt.cleanupTicker = time.NewTicker(5 * time.Minute)
+	go func() {
+		for {
+			select {
+			case <-rt.cleanupTicker.C:
+				rt.cleanup()
+			case <-rt.stopChan:
+				rt.cleanupTicker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+func (rt *RolloutTracker) cleanup() {
+	rt.mu.Lock()
+	cutoff := time.Now().Add(-rt.rolloutWindow)
+
+	var keysToDelete []string
+	for key, record := range rt.activeRollouts {
+		if record.LastUpdateTime.Before(cutoff) {
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+	rt.mu.Unlock()
+
+	for _, key := range keysToDelete {
+		rt.mu.Lock()
+		record, exists := rt.activeRollouts[key]
+		if exists {
+			if record.completionTimer != nil {
+				record.completionTimer.Stop()
+				select {
+				case <-record.completionTimer.C:
+				default:
+				}
+				record.completionTimer = nil
+			}
+			delete(rt.activeRollouts, key)
+			log.Printf("🧹 Cleaned up stale rollout record for %s", key)
+		}
+		rt.mu.Unlock()
+	}
+}
+
+func (rt *RolloutTracker) Stop() {
+	// Stop cleanup ticker
+	if rt.cleanupTicker != nil {
+		rt.cleanupTicker.Stop()
+	}
+
+	// Stop all active timers to prevent goroutine leaks
+	rt.mu.Lock()
+	for _, record := range rt.activeRollouts {
+		if record.completionTimer != nil {
+			record.completionTimer.Stop()
+			// Drain timer channel to prevent goroutine leak
+			select {
+			case <-record.completionTimer.C:
+			default:
+			}
+			record.completionTimer = nil
+		}
+	}
+	rt.mu.Unlock()
+
+	// Cancel worker context
+	if rt.workerCancel != nil {
+		rt.workerCancel()
+	}
+
+	// Close channels
+	close(rt.stopChan)
+	close(rt.notificationWorker)
+
+	log.Printf("RolloutTracker stopped, cleaned up %d active rollouts", len(rt.activeRollouts))
+}
+
+func (rt *RolloutTracker) trackDeploymentChange(kind, namespace, name, oldVersion, newVersion string) {
+	deploymentKey := fmt.Sprintf("%s/%s", namespace, name)
+
+	rt.mu.Lock()
+	record, exists := rt.activeRollouts[deploymentKey]
+
+	if !exists {
+		// Start tracking a new rollout
+		record = &RolloutRecord{
+			DeploymentKey:    deploymentKey,
+			StartTime:        time.Now(),
+			OldVersion:       oldVersion,
+			LatestVersion:    newVersion,
+			ChangeCount:      1,
+			NotificationSent: false,
+			LastUpdateTime:   time.Now(),
+			lastEventTime:    time.Now(),
+		}
+		rt.activeRollouts[deploymentKey] = record
+		rt.mu.Unlock()
+		record.completionTimer = time.AfterFunc(10*time.Second, func() {
+			rt.completeRollout(deploymentKey)
+		})
+
+		log.Printf("🔄 New rollout started for %s (old: %s -> new: %s)", deploymentKey, oldVersion, newVersion)
+		return
+	}
+
+	// Continue tracking existing rollout
+	record.LatestVersion = newVersion
+	record.ChangeCount++
+	record.LastUpdateTime = time.Now()
+	record.lastEventTime = time.Now()
+
+	// Reset completion timer
+	if record.completionTimer != nil {
+		record.completionTimer.Stop()
+		// Drain timer channel to prevent goroutine leak
+		select {
+		case <-record.completionTimer.C:
+		default:
+		}
+	}
+	rt.mu.Unlock() // Release lock early
+
+	// Create new timer outside of lock
+	record.completionTimer = time.AfterFunc(10*time.Second, func() {
+		rt.completeRollout(deploymentKey)
+	})
+
+	log.Printf("📝 Rollout update for %s (version: %s, total changes: %d)", deploymentKey, newVersion, record.ChangeCount)
+}
+
+func (rt *RolloutTracker) completeRollout(deploymentKey string) {
+	rt.mu.Lock()
+	record, exists := rt.activeRollouts[deploymentKey]
+	if !exists {
+		rt.mu.Unlock()
+		return
+	}
+
+	// Mark rollout as complete and send final notification
+	record.NotificationSent = true
+	rolloutDuration := time.Since(record.StartTime)
+
+	// Stop and clean up timer
+	if record.completionTimer != nil {
+		record.completionTimer.Stop()
+		// Drain timer channel to prevent goroutine leak
+		select {
+		case <-record.completionTimer.C:
+		default:
+		}
+		record.completionTimer = nil
+	}
+
+	// Clean up the rollout record
+	delete(rt.activeRollouts, deploymentKey)
+	rt.mu.Unlock()
+
+	log.Printf("Rollout completed for %s (final version: %s, total changes: %d, duration: %v)",
+		deploymentKey, record.LatestVersion, record.ChangeCount, rolloutDuration)
+
+	// Send final notification using worker pool
+	if rt.notifier != nil {
+		// Parse deployment key safely
+		parts := strings.Split(deploymentKey, "/")
+		if len(parts) != 2 {
+			log.Printf("Invalid deployment key format: %s", deploymentKey)
+			return
+		}
+
+		// Create a comprehensive notification event
+		notificationEvent := &ResourceEvent{
+			Type:         "ROLLOUT_COMPLETED",
+			ResourceKind: "Deployment",
+			ResourceName: parts[1],
+			Namespace:    parts[0],
+			User:         "system",
+			Timestamp:    time.Now(),
+			Priority:     PriorityHigh,
+		}
+
+		// Use worker pool instead of unbounded goroutines
+		select {
+		case rt.notificationWorker <- &notificationTask{event: notificationEvent, record: record}:
+			// Task queued successfully
+		default:
+			log.Printf("Notification worker pool full, dropping rollout notification for %s", deploymentKey)
+		}
+	}
+}
+
+func (rt *RolloutTracker) sendRolloutNotification(event *ResourceEvent, record *RolloutRecord) error {
+	log.Printf("ROLLOUT COMPLETED: %s/%s - %d changes over %v (old: %s -> final: %s)",
+		event.Namespace, event.ResourceName, record.ChangeCount,
+		time.Since(record.StartTime), record.OldVersion, record.LatestVersion)
+
+	return nil
+}
+
+// ResourceStateManager provides in-memory resource state management
+type ResourceStateManager struct {
+	mu            sync.RWMutex
+	inMemoryState map[string]map[string]resourceInfo
+}
+
+// NewResourceStateManager creates a new in-memory resource state manager
+func NewResourceStateManager() *ResourceStateManager {
+	rsm := &ResourceStateManager{
+		inMemoryState: make(map[string]map[string]resourceInfo),
+	}
+
+	return rsm
+}
+
+// GetResourceInfo retrieves in-memory resource information
+func (rsm *ResourceStateManager) GetResourceInfo(watcherKey, resourceKey string) (resourceInfo, bool) {
+	rsm.mu.RLock()
+	defer rsm.mu.RUnlock()
+
+	if watcherState, exists := rsm.inMemoryState[watcherKey]; exists {
+		if info, exists := watcherState[resourceKey]; exists {
+			return info, true
+		}
+	}
+	return resourceInfo{}, false
+}
+
+// SetResourceInfo stores in-memory resource information
+func (rsm *ResourceStateManager) SetResourceInfo(watcherKey, resourceKey string, info resourceInfo) {
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+
+	if rsm.inMemoryState[watcherKey] == nil {
+		rsm.inMemoryState[watcherKey] = make(map[string]resourceInfo)
+	}
+	rsm.inMemoryState[watcherKey][resourceKey] = info
+}
+
+// DeleteResourceInfo removes in-memory resource information
+func (rsm *ResourceStateManager) DeleteResourceInfo(watcherKey, resourceKey string) {
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+
+	if watcherState, exists := rsm.inMemoryState[watcherKey]; exists {
+		delete(watcherState, resourceKey)
+	}
+}
+
+// GetWatcherState retrieves all resources for a specific watcher
+func (rsm *ResourceStateManager) GetWatcherState(watcherKey string) map[string]resourceInfo {
+	rsm.mu.RLock()
+	defer rsm.mu.RUnlock()
+
+	if watcherState, exists := rsm.inMemoryState[watcherKey]; exists {
+		log.Printf("ResourceStateManager: Retrieved in-memory state for %s with %d resources", watcherKey, len(watcherState))
+		result := make(map[string]resourceInfo)
+		for k, v := range watcherState {
+			result[k] = v
+		}
+		return result
+	}
+	log.Printf("ResourceStateManager: No in-memory state found for %s, returning empty map", watcherKey)
+	return make(map[string]resourceInfo)
+}
+
+// SetWatcherState stores all resources for a specific watcher
+func (rsm *ResourceStateManager) SetWatcherState(watcherKey string, resources map[string]resourceInfo) {
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+
+	log.Printf("ResourceStateManager: Saving in-memory state for %s with %d resources", watcherKey, len(resources))
+	rsm.inMemoryState[watcherKey] = resources
 }

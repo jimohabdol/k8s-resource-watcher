@@ -25,13 +25,28 @@ spec:
         fsGroup: 2000
       containers:
       - name: resource-watcher
-        image: resource-watcher:test
-        imagePullPolicy: IfNotPresent
+        image: k8s-resource-watcher:test
+        imagePullPolicy: Never
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
             drop: ["ALL"]
         env:
+        - name: SMTP_HOST
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: smtp-host
+        - name: SMTP_PORT
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: smtp-port
+        - name: USE_AUTH
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: use-auth
         - name: SMTP_USERNAME
           valueFrom:
             secretKeyRef:
@@ -54,11 +69,11 @@ spec:
               key: to-emails
         resources:
           requests:
-            cpu: "100m"
-            memory: "128Mi"
+            cpu: "50m"
+            memory: "64Mi"
           limits:
-            cpu: "200m"
-            memory: "256Mi"
+            cpu: "150m"
+            memory: "128Mi"
         ports:
         - name: http
           containerPort: 8080
