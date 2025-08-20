@@ -545,9 +545,50 @@ func (w *ResourceWatcher) hasImportantFieldsChanged(resourceKind string, oldObj,
 		oldSpec := oldObj.Object["spec"]
 		newSpec := newObj.Object["spec"]
 		return !reflect.DeepEqual(oldSpec, newSpec)
+	case "NetworkPolicy":
+		oldSpec := oldObj.Object["spec"]
+		newSpec := newObj.Object["spec"]
+		return !reflect.DeepEqual(oldSpec, newSpec)
 	default:
 		return true
 	}
+}
+
+func (w *ResourceWatcher) shouldBypassRolloutTracking(resourceKind string) bool {
+	bypassResources := map[string]bool{
+		"ConfigMap":               true,
+		"Secret":                  true,
+		"Service":                 true,
+		"Ingress":                 true,
+		"NetworkPolicy":           true,
+		"PersistentVolumeClaim":   true,
+		"ServiceAccount":          true,
+		"Role":                    true,
+		"RoleBinding":             true,
+		"ClusterRole":             true,
+		"ClusterRoleBinding":      true,
+		"PodDisruptionBudget":     true,
+		"HorizontalPodAutoscaler": true,
+		"VerticalPodAutoscaler":   true,
+		"PodSecurityPolicy":       true,
+		"LimitRange":              true,
+		"ResourceQuota":           true,
+	}
+
+	return bypassResources[resourceKind]
+}
+
+func (w *ResourceWatcher) getRolloutTrackingStatus(resourceKind string) string {
+	if w.shouldBypassRolloutTracking(resourceKind) {
+		return "BYPASSED - Infrastructure resource, immediate notification"
+	}
+	return "ENABLED - Deployment resource, grouped notification"
+}
+
+func (w *ResourceWatcher) logResourceChangeBehavior(resourceKind, namespace, name, changeType string) {
+	trackingStatus := w.getRolloutTrackingStatus(resourceKind)
+	log.Printf("[%s] Resource %s/%s %s - Rollout tracking: %s",
+		resourceKind, namespace, name, changeType, trackingStatus)
 }
 
 func (w *ResourceWatcher) hasFieldChanged(oldSpec, newSpec map[string]interface{}, fieldName string) bool {
@@ -1826,16 +1867,31 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 							hasImportantFieldsChanged := w.hasImportantFieldsChanged(resourceConfig.Kind, existingInfo.object, obj)
 
 							if hasImportantFieldsChanged {
-								if resourceConfig.Kind == "Deployment" {
-									w.rolloutTracker.trackDeploymentChange(resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), existingInfo.version, metadata.GetResourceVersion())
-								}
-								log.Printf("[%s] Resource %s/%s IMPORTANT FIELDS CHANGED by %s (version: %s -> %s) - ROLLOUT IN PROGRESS, LOGGING FOR AUDIT",
-									resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user,
-									existingInfo.version, metadata.GetResourceVersion())
+								w.logResourceChangeBehavior(resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), "IMPORTANT_FIELDS_CHANGED")
 
-								w.metrics.EventsSkipped++
-								log.Printf("[%s] Skipping individual notification for %s/%s - will notify when rollout completes",
-									resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
+								if w.shouldBypassRolloutTracking(resourceConfig.Kind) {
+									log.Printf("[%s] Resource %s/%s IMPORTANT FIELDS CHANGED by %s (version: %s -> %s) - INFRASTRUCTURE CHANGE, SENDING IMMEDIATE NOTIFICATION",
+										resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user,
+										existingInfo.version, metadata.GetResourceVersion())
+
+									w.eventCorrelator.addEvent(resourceEvent)
+									if w.queueEventWithBackpressure(resourceEvent) {
+										eventProcessed = true
+										w.metrics.EventsBatched++
+										log.Printf("[%s] Successfully queued infrastructure change notification for %s/%s", resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
+									}
+								} else {
+									if resourceConfig.Kind == "Deployment" {
+										w.rolloutTracker.trackDeploymentChange(resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), existingInfo.version, metadata.GetResourceVersion())
+									}
+									log.Printf("[%s] Resource %s/%s IMPORTANT FIELDS CHANGED by %s (version: %s -> %s) - ROLLOUT IN PROGRESS, LOGGING FOR AUDIT",
+										resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user,
+										existingInfo.version, metadata.GetResourceVersion())
+
+									w.metrics.EventsSkipped++
+									log.Printf("[%s] Skipping individual notification for %s/%s - will notify when rollout completes",
+										resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
+								}
 							} else if timeSinceLastModification >= adaptiveCooldown {
 								// NON-IMPORTANT FIELD CHANGE: Apply cooldown to prevent spam
 								log.Printf("[%s] Resource %s/%s was MODIFIED (non-important fields) by %s (version: %s -> %s, frequency: %.1f/min, cooldown: %v) - SENDING NOTIFICATION",
@@ -1861,31 +1917,46 @@ func (w *ResourceWatcher) processWatchEvents(ctx context.Context, resourceConfig
 						}
 					}
 				} else {
-					if resourceConfig.Kind == "Deployment" {
-						log.Printf("[%s] Resource %s/%s was MODIFIED (new resource) by %s - checking for rollout tracking",
+					w.logResourceChangeBehavior(resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), "NEW_RESOURCE")
+
+					if w.shouldBypassRolloutTracking(resourceConfig.Kind) {
+						log.Printf("[%s] Resource %s/%s was MODIFIED (new infrastructure resource) by %s - SENDING IMMEDIATE NOTIFICATION",
 							resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 
-						hasImportantFieldsChanged := w.hasImportantFieldsChanged(resourceConfig.Kind, nil, obj)
-						if hasImportantFieldsChanged {
-							log.Printf("[%s] Resource %s/%s IMPORTANT FIELDS CHANGED (new resource) - ROLLOUT IN PROGRESS, LOGGING FOR AUDIT",
-								resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
-							w.metrics.EventsSkipped++
+						w.eventCorrelator.addEvent(resourceEvent)
+						if w.queueEventWithBackpressure(resourceEvent) {
+							eventProcessed = true
+							w.metrics.EventsBatched++
+							log.Printf("[%s] Successfully queued new infrastructure resource notification for %s/%s", resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
+						}
+					} else {
+						if resourceConfig.Kind == "Deployment" {
+							log.Printf("[%s] Resource %s/%s was MODIFIED (new deployment resource) by %s - checking for rollout tracking",
+								resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
+
+							hasImportantFieldsChanged := w.hasImportantFieldsChanged(resourceConfig.Kind, nil, obj)
+							if hasImportantFieldsChanged {
+								log.Printf("[%s] Resource %s/%s IMPORTANT FIELDS CHANGED (new deployment) - ROLLOUT IN PROGRESS, LOGGING FOR AUDIT",
+									resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
+								w.metrics.EventsSkipped++
+							} else {
+								log.Printf("[%s] Resource %s/%s NON-IMPORTANT FIELDS CHANGED (new deployment) - SENDING NOTIFICATION",
+									resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
+								w.eventCorrelator.addEvent(resourceEvent)
+								if w.queueEventWithBackpressure(resourceEvent) {
+									eventProcessed = true
+									w.metrics.EventsBatched++
+								}
+							}
 						} else {
-							log.Printf("[%s] Resource %s/%s NON-IMPORTANT FIELDS CHANGED (new resource) - SENDING NOTIFICATION",
-								resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName())
+							// deployment-like resources (StatefulSet, DaemonSet, Job)
+							log.Printf("[%s] Resource %s/%s was MODIFIED (new deployment-like resource) by %s - SENDING NOTIFICATION",
+								resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
 							w.eventCorrelator.addEvent(resourceEvent)
 							if w.queueEventWithBackpressure(resourceEvent) {
 								eventProcessed = true
 								w.metrics.EventsBatched++
 							}
-						}
-					} else {
-						log.Printf("[%s] Resource %s/%s was MODIFIED (new resource) by %s",
-							resourceConfig.Kind, metadata.GetNamespace(), metadata.GetName(), user)
-						w.eventCorrelator.addEvent(resourceEvent)
-						if w.queueEventWithBackpressure(resourceEvent) {
-							eventProcessed = true
-							w.metrics.EventsBatched++
 						}
 					}
 				}
