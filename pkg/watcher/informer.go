@@ -37,7 +37,7 @@ type InformerWatcher struct {
 	mu        sync.RWMutex
 	ctx       context.Context
 	cancel    context.CancelFunc
-	isStarted bool 
+	isStarted bool
 }
 
 func NewInformerWatcher(cfg *config.Config, notifier notifier.Notifier) (*InformerWatcher, error) {
@@ -175,7 +175,22 @@ func (w *InformerWatcher) createInformer(resourceConfig config.ResourceConfig) e
 	w.informers[resourceConfig.Kind] = informer
 	w.mu.Unlock()
 
-	log.Printf("Created informer for %s in namespace %s", resourceConfig.Kind, resourceConfig.Namespace)
+	// Log the monitoring configuration
+	if resourceConfig.ResourceName != "" {
+		if resourceConfig.Namespace != "" {
+			log.Printf("Created informer for %s '%s' in namespace '%s'",
+				resourceConfig.Kind, resourceConfig.ResourceName, resourceConfig.Namespace)
+		} else {
+			log.Printf("Created informer for %s '%s' across all namespaces",
+				resourceConfig.Kind, resourceConfig.ResourceName)
+		}
+	} else if resourceConfig.Namespace != "" {
+		log.Printf("Created informer for all %s resources in namespace '%s'",
+			resourceConfig.Kind, resourceConfig.Namespace)
+	} else {
+		log.Printf("Created informer for all %s resources across all namespaces",
+			resourceConfig.Kind)
+	}
 	return nil
 }
 
@@ -218,7 +233,7 @@ func (w *InformerWatcher) createDeploymentEventHandler(resourceConfig config.Res
 				log.Printf("[Deployment] Resource discovered during startup sync - will track for important field changes")
 				return
 			}
-			w.handleDeploymentAdded(obj)
+			w.handleDeploymentAdded(obj, resourceConfig)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			// Skip notifications during startup sync
@@ -240,7 +255,7 @@ func (w *InformerWatcher) createDeploymentEventHandler(resourceConfig config.Res
 			if !started {
 				return
 			}
-			w.handleDeploymentDeleted(obj)
+			w.handleDeploymentDeleted(obj, resourceConfig)
 		},
 	}
 }
@@ -253,13 +268,8 @@ func (w *InformerWatcher) handleResourceAdded(obj interface{}, resourceConfig co
 		return
 	}
 
-	// Check namespace filter
-	if resourceConfig.Namespace != "" && unstructuredObj.GetNamespace() != resourceConfig.Namespace {
-		return
-	}
 
-	// Check name filter
-	if resourceConfig.ResourceName != "" && unstructuredObj.GetName() != resourceConfig.ResourceName {
+	if !w.shouldProcessResource(unstructuredObj, resourceConfig) {
 		return
 	}
 
@@ -283,13 +293,8 @@ func (w *InformerWatcher) handleResourceUpdated(oldObj, newObj interface{}, reso
 		return
 	}
 
-	// Check namespace filter
-	if resourceConfig.Namespace != "" && newUnstructured.GetNamespace() != resourceConfig.Namespace {
-		return
-	}
 
-	// Check name filter
-	if resourceConfig.ResourceName != "" && newUnstructured.GetName() != resourceConfig.ResourceName {
+	if !w.shouldProcessResource(newUnstructured, resourceConfig) {
 		return
 	}
 
@@ -307,13 +312,8 @@ func (w *InformerWatcher) handleResourceDeleted(obj interface{}, resourceConfig 
 		return
 	}
 
-	// Check namespace filter
-	if resourceConfig.Namespace != "" && unstructuredObj.GetNamespace() != resourceConfig.Namespace {
-		return
-	}
-
-	// Check name filter
-	if resourceConfig.ResourceName != "" && unstructuredObj.GetName() != resourceConfig.ResourceName {
+	
+	if !w.shouldProcessResource(unstructuredObj, resourceConfig) {
 		return
 	}
 
@@ -324,8 +324,18 @@ func (w *InformerWatcher) handleResourceDeleted(obj interface{}, resourceConfig 
 }
 
 // handleDeploymentAdded handles ADDED events for Deployments
-func (w *InformerWatcher) handleDeploymentAdded(obj interface{}) {
-	log.Printf("[Deployment] Resource discovered - will track for important field changes")
+func (w *InformerWatcher) handleDeploymentAdded(obj interface{}, resourceConfig config.ResourceConfig) {
+	deployment, ok := obj.(*appsv1.Deployment)
+	if !ok {
+		log.Printf("[Deployment] Failed to convert to deployment object")
+		return
+	}
+
+	if !w.shouldProcessDeployment(deployment, resourceConfig) {
+		return
+	}
+
+	log.Printf("[Deployment] Resource %s/%s discovered - will track for important field changes", deployment.Namespace, deployment.Name)
 }
 
 // handleDeploymentUpdated handles MODIFIED events for Deployments
@@ -342,13 +352,8 @@ func (w *InformerWatcher) handleDeploymentUpdated(oldObj, newObj interface{}, re
 		return
 	}
 
-	// Check namespace filter
-	if resourceConfig.Namespace != "" && newDeployment.Namespace != resourceConfig.Namespace {
-		return
-	}
-
-	// Check name filter
-	if resourceConfig.ResourceName != "" && newDeployment.Name != resourceConfig.ResourceName {
+	
+	if !w.shouldProcessDeployment(newDeployment, resourceConfig) {
 		return
 	}
 
@@ -406,11 +411,15 @@ func (w *InformerWatcher) hasImportantDeploymentChanges(oldDeployment, newDeploy
 	return false
 }
 
-func (w *InformerWatcher) handleDeploymentDeleted(obj interface{}) {
+func (w *InformerWatcher) handleDeploymentDeleted(obj interface{}, resourceConfig config.ResourceConfig) {
 	deployment, ok := obj.(*appsv1.Deployment)
 	if !ok {
-		log.Printf("[Deployment] Resource was DELETED")
-		w.sendNotification("Deployment", "DELETED", "unknown", "default")
+		log.Printf("[Deployment] Failed to convert to deployment object")
+		return
+	}
+
+	// Check if this deployment matches our filter criteria
+	if !w.shouldProcessDeployment(deployment, resourceConfig) {
 		return
 	}
 
@@ -444,4 +453,33 @@ func (w *InformerWatcher) getCacheSyncFuncs() []cache.InformerSynced {
 	}
 
 	return syncFuncs
+}
+
+// shouldProcessResource checks if a resource should be processed based on configuration
+func (w *InformerWatcher) shouldProcessResource(obj *unstructured.Unstructured, resourceConfig config.ResourceConfig) bool {
+	objNamespace := obj.GetNamespace()
+	objName := obj.GetName()
+
+	if resourceConfig.Namespace != "" && objNamespace != resourceConfig.Namespace {
+		return false
+	}
+
+	if resourceConfig.ResourceName != "" && objName != resourceConfig.ResourceName {
+		return false
+	}
+
+	return true
+}
+
+// shouldProcessDeployment checks if a deployment should be processed based on configuration
+func (w *InformerWatcher) shouldProcessDeployment(deployment *appsv1.Deployment, resourceConfig config.ResourceConfig) bool {
+	if resourceConfig.Namespace != "" && deployment.Namespace != resourceConfig.Namespace {
+		return false
+	}
+
+	if resourceConfig.ResourceName != "" && deployment.Name != resourceConfig.ResourceName {
+		return false
+	}
+
+	return true
 }

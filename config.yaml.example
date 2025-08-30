@@ -21,29 +21,43 @@ watcher:
   resourceVersionCheck: true         # Enable resource version optimization
   metricsEnabled: true               # Enable metrics collection and observability
 
-# List of resources to watch
+# Resource monitoring configuration
 resources:
-  - kind: "ConfigMap"
-    namespace: "default"  # Watch all ConfigMaps in default namespace
-  - kind: "Secret"
-    namespace: "kube-system"  # Watch all Secrets in kube-system namespace
+  # Monitor all Deployments in the default namespace
   - kind: "Deployment"
-    namespace: "default"  # Watch deployments in default namespace
+    namespace: "default"
+  
+  # Monitor a specific ConfigMap by name
+  - kind: "ConfigMap"
+    namespace: "default"
+    resourceName: "app-config"
+  
+  # Monitor a specific Secret by name
+  - kind: "Secret"
+    namespace: "default"
+    resourceName: "database-credentials"
+  
+  # Monitor all Services in the default namespace
   - kind: "Service"
-    namespace: ""         # Watch all services in all namespaces
+    namespace: "default"
+  
+  # Monitor a specific Ingress by name
   - kind: "Ingress"
-    namespace: "default"  # Watch ingresses in default namespace
+    namespace: "default"
+    resourceName: "web-app-ingress"
   
-  # Example: Watch specific resources by name
-  # - kind: "ConfigMap"
-  #   namespace: "default"
-  #   name: "my-app-config"  # Watch specific ConfigMap
+  # Monitor all ConfigMaps across all namespaces
+  - kind: "ConfigMap"
+    namespace: ""
   
-  # Example: Watch resources in multiple namespaces
-  # - kind: "Deployment"
-  #   namespace: "prod"
-  # - kind: "ConfigMap"
-  #   namespace: "prod"
+  # Monitor a specific Deployment by name in a specific namespace
+  - kind: "Deployment"
+    namespace: "production"
+    resourceName: "web-app"
+  
+  # Monitor all Secrets in the kube-system namespace
+  - kind: "Secret"
+    namespace: "kube-system"
 
 # Email configuration
 email:

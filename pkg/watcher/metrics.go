@@ -79,12 +79,23 @@ func (m *WatcherMetrics) RecordDeploymentChangeIgnored() {
 }
 
 // GetMetrics returns a copy of the current metrics
-func (m *WatcherMetrics) GetMetrics() WatcherMetrics {
+func (m *WatcherMetrics) GetMetrics() *WatcherMetrics {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	metrics := *m
-	metrics.FieldChanges = make(map[string]int64)
+	metrics := &WatcherMetrics{
+		EventsProcessed:           m.EventsProcessed,
+		EventsFiltered:            m.EventsFiltered,
+		NotificationsSent:         m.NotificationsSent,
+		NotificationsFailed:       m.NotificationsFailed,
+		DeploymentChangesDetected: m.DeploymentChangesDetected,
+		DeploymentChangesIgnored:  m.DeploymentChangesIgnored,
+		StartupSyncTime:           m.StartupSyncTime,
+		LastEventTime:             m.LastEventTime,
+		FieldChanges:              make(map[string]int64),
+	}
+
+	// Copy the field changes map
 	for k, v := range m.FieldChanges {
 		metrics.FieldChanges[k] = v
 	}
