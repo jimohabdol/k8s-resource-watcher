@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resource-watcher
+  namespace: default
+  labels:
+    app: resource-watcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: resource-watcher
+  template:
+    metadata:
+      labels:
+        app: resource-watcher
+      annotations:
+        openshift.io/scc: restricted
+    spec:
+      serviceAccountName: resource-watcher
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 2000
+      containers:
+      - name: resource-watcher
+        image: k8s-resource-watcher:enhanced
+        imagePullPolicy: Always
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        env:
+        - name: SMTP_HOST
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: smtp-host
+        - name: SMTP_PORT
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: smtp-port
+        - name: USE_AUTH
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: use-auth
+        - name: SMTP_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: smtp-username
+        - name: SMTP_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: smtp-password
+        - name: FROM_EMAIL
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: from-email
+        - name: TO_EMAILS
+          valueFrom:
+            secretKeyRef:
+              name: smtp-credentials
+              key: to-emails
+        - name: LOG_LEVEL
+          value: "info"
+        - name: LOG_FORMAT
+          value: "text"
+        - name: LOG_JSON
+          value: "false"
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "150m"
+            memory: "128Mi"
+        ports:
+        - name: http
+          containerPort: 8080
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+      volumes:
+      - name: config-volume
+        configMap:
+          name: resource-watcher-config
+      - name: tmp
+        emptyDir: {}
+---
+# Add NetworkPolicy to restrict traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: resource-watcher
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: resource-watcher
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - ports:
+    - port: 8080
+      protocol: TCP
+  egress:
+  - ports:
+    - port: 587
+      protocol: TCP  # SMTP
+    - port: 443
+      protocol: TCP  # HTTPS for K8s API
+    - port: 53
+      protocol: UDP  # DNS
+    - port: 53
+      protocol: TCP  # DNS 

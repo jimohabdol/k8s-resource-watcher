@@ -1,0 +1,55 @@
+# Version control
+.git
+.gitignore
+
+# Kubernetes manifests
+k8s/
+
+# Development and IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+/resource-watcher
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test files
+*_test.go
+*.test
+/coverage*
+*.out
+
+# Local configuration and sensitive files
+config.yaml
+.env
+*.pem
+*.key
+*.crt
+
+# Documentation
+*.md
+LICENSE
+docs/
+
+# Dependencies
+/vendor/
+
+# Temporary files
+/tmp/
+*.tmp
+*.log
+
+# Docker files (except Dockerfile)
+.dockerignore
+docker-compose*
+
+# Debug files
+debug/
+*.debug 

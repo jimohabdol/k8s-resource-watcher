@@ -1,0 +1,69 @@
+clusterName: "my-cluster"
+
+# Watcher configuration
+watcher:
+  # Deployment monitoring - only notify when these important fields change
+  # This prevents HPA/controller replica changes from triggering notifications
+  deploymentImportantFields:
+    - "containers"              # Container image, env vars, resources, ports
+    - "volumes"                 # Volume mounts and configurations
+    - "serviceAccountName"      # Service account changes
+    - "nodeSelector"            # Node selection rules
+    - "affinity"                # Pod affinity/anti-affinity
+    - "tolerations"             # Node tolerations
+    - "securityContext"         # Security settings
+    - "imagePullSecrets"        # Image pull secrets
+    - "hostAliases"             # Host alias configurations
+    - "initContainers"          # Init container changes
+  
+  # Enhanced features for production use
+  eventDeduplicationWindow: "30s"    # Prevent duplicate notifications (30s, 1m, 5m)
+  resourceVersionCheck: true         # Enable resource version optimization
+  metricsEnabled: true               # Enable metrics collection and observability
+
+# List of resources to watch
+resources:
+  - kind: "ConfigMap"
+    namespace: "default"  # Watch all ConfigMaps in default namespace
+  - kind: "Secret"
+    namespace: "kube-system"  # Watch all Secrets in kube-system namespace
+  - kind: "Deployment"
+    namespace: "default"  # Watch deployments in default namespace
+  - kind: "Service"
+    namespace: ""         # Watch all services in all namespaces
+  - kind: "Ingress"
+    namespace: "default"  # Watch ingresses in default namespace
+  
+  # Example: Watch specific resources by name
+  # - kind: "ConfigMap"
+  #   namespace: "default"
+  #   name: "my-app-config"  # Watch specific ConfigMap
+  
+  # Example: Watch resources in multiple namespaces
+  # - kind: "Deployment"
+  #   namespace: "prod"
+  # - kind: "ConfigMap"
+  #   namespace: "prod"
+
+# Email configuration
+email:
+  smtpHost: "smtp.example.com"
+  smtpPort: 587
+  useAuth: true
+  smtpUsername: "your-email@example.com"
+  smtpPassword: "your-password"
+  fromEmail: "k8s-watcher@example.com"
+  toEmails:
+    - "admin@example.com"
+    - "ops@example.com"
+  
+  # TLS Configuration (optional - defaults are smart based on port)
+  # enableTLS: true        # Enable TLS (default: true for 587/465, false for 25)
+  # insecureTLS: false     # Skip TLS verification (default: false, except for port 25)
+  # forceSSL: false        # Force SSL connection (default: false, except for port 465)
+
+# Logging configuration
+logging:
+  level: "info"      # debug, info, warn, error
+  format: "text"     # text, json
+  enableJSON: false 

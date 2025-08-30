@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: resource-watcher-config
+  namespace: default
+data:
+  config.yaml: |
+    clusterName: "test-cluster"
+
+    # Watcher configuration
+    watcher:
+      # Deployment monitoring - only notify when these important fields change
+      # This prevents HPA/controller replica changes from triggering notifications
+      deploymentImportantFields:
+        - "containers"
+        - "volumes"
+        - "serviceAccountName"
+        - "nodeSelector"
+        - "affinity"
+        - "tolerations"
+        - "securityContext"
+        - "imagePullSecrets"
+        - "hostAliases"
+      
+      eventDeduplicationWindow: "30s"    # Prevent duplicate notifications (30s, 1m, 5m)
+      resourceVersionCheck: true         # Enable resource version optimization
+      metricsEnabled: true               # Enable metrics collection and observability
+
+    resources:
+      # Watch all Deployments in the default namespace
+      - kind: Deployment
+        namespace: default
+      
+      # Watch all ConfigMaps in the default namespace
+      - kind: ConfigMap
+        namespace: default
+      
+      # Watch all Secrets in the default namespace
+      - kind: Secret
+        namespace: default
+      
+      # Watch all Ingresses in the default namespace
+      - kind: Ingress
+        namespace: default
+      
+      # Test resources in resource-watcher-test namespace
+      - kind: Deployment
+        namespace: resource-watcher-test
+      - kind: ConfigMap
+        namespace: resource-watcher-test
+      - kind: Secret
+        namespace: resource-watcher-test
+      - kind: Service
+        namespace: resource-watcher-test
+      - kind: Ingress
+        namespace: resource-watcher-test
+
+    email:
+      smtpHost: ""
+      smtpPort: 587
+      useAuth: true
+      smtpUsername: ""
+      smtpPassword: ""
+      fromEmail: ""
+      toEmails: [""]
+
+    # Logging configuration
+    logging:
+      level: "info"
+      format: "text"
+      enableJSON: false 

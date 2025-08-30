@@ -1,0 +1,28 @@
+# Binaries and build artifacts
+*/bin
+/resource-watcher
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+/vendor/
+
+# IDE directories
+.idea/
+.vscode/
+
+# Configuration files with sensitive data
+config.yaml
+.env
+
+# OS-specific files
+.DS_Store
+Thumbs.db 
