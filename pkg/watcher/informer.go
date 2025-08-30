@@ -335,7 +335,9 @@ func (w *InformerWatcher) handleDeploymentAdded(obj interface{}, resourceConfig 
 		return
 	}
 
-	log.Printf("[Deployment] Resource %s/%s discovered - will track for important field changes", deployment.Namespace, deployment.Name)
+	log.Printf("[Deployment] Resource %s/%s was ADDED", deployment.Namespace, deployment.Name)
+	
+	w.sendNotification("Deployment", "ADDED", deployment.Name, deployment.Namespace)
 }
 
 // handleDeploymentUpdated handles MODIFIED events for Deployments
