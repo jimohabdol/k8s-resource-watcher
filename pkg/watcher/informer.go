@@ -268,7 +268,6 @@ func (w *InformerWatcher) handleResourceAdded(obj interface{}, resourceConfig co
 		return
 	}
 
-
 	if !w.shouldProcessResource(unstructuredObj, resourceConfig) {
 		return
 	}
@@ -293,7 +292,6 @@ func (w *InformerWatcher) handleResourceUpdated(oldObj, newObj interface{}, reso
 		return
 	}
 
-
 	if !w.shouldProcessResource(newUnstructured, resourceConfig) {
 		return
 	}
@@ -312,7 +310,6 @@ func (w *InformerWatcher) handleResourceDeleted(obj interface{}, resourceConfig 
 		return
 	}
 
-	
 	if !w.shouldProcessResource(unstructuredObj, resourceConfig) {
 		return
 	}
@@ -336,7 +333,7 @@ func (w *InformerWatcher) handleDeploymentAdded(obj interface{}, resourceConfig 
 	}
 
 	log.Printf("[Deployment] Resource %s/%s was ADDED", deployment.Namespace, deployment.Name)
-	
+
 	w.sendNotification("Deployment", "ADDED", deployment.Name, deployment.Namespace)
 }
 
@@ -354,7 +351,6 @@ func (w *InformerWatcher) handleDeploymentUpdated(oldObj, newObj interface{}, re
 		return
 	}
 
-	
 	if !w.shouldProcessDeployment(newDeployment, resourceConfig) {
 		return
 	}
