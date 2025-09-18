@@ -103,9 +103,6 @@ func (e *EmailConfig) Validate() error {
 	}
 
 	if e.UseAuth {
-		if e.SMTPUsername == "" {
-			return fmt.Errorf("SMTP username is required when authentication is enabled")
-		}
 		if e.SMTPPassword == "" {
 			return fmt.Errorf("SMTP password is required when authentication is enabled")
 		}

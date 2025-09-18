@@ -31,10 +31,15 @@ type EmailNotifier struct {
 // NewEmailNotifier creates a new email notifier
 func NewEmailNotifier(cfg *config.Config) *EmailNotifier {
 	// Create dialer with appropriate settings
+	username := cfg.Email.SMTPUsername
+	if username == "" && cfg.Email.UseAuth {
+		username = ""
+	}
+
 	dialer := gomail.NewDialer(
 		cfg.Email.SMTPHost,
 		cfg.Email.SMTPPort,
-		cfg.Email.SMTPUsername,
+		username,
 		cfg.Email.SMTPPassword,
 	)
 

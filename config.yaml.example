@@ -64,7 +64,7 @@ email:
   smtpHost: "smtp.example.com"
   smtpPort: 587
   useAuth: true
-  smtpUsername: "your-email@example.com"
+  smtpUsername: "your-email@example.com"  # Optional
   smtpPassword: "your-password"
   fromEmail: "k8s-watcher@example.com"
   toEmails:
@@ -75,6 +75,12 @@ email:
   # enableTLS: true        # Enable TLS (default: true for 587/465, false for 25)
   # insecureTLS: false     # Skip TLS verification (default: false, except for port 25)
   # forceSSL: false        # Force SSL connection (default: false, except for port 465)
+  
+  # For SMTP port 25 with password-only authentication:
+  # smtpPort: 25
+  # useAuth: true
+  # smtpUsername: ""  # Leave empty for password-only auth
+  # smtpPassword: "your-password"
 
 # Logging configuration
 logging:
