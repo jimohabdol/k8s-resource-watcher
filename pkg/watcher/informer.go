@@ -38,6 +38,7 @@ type InformerWatcher struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	isStarted bool
+	syncDone  bool
 }
 
 func NewInformerWatcher(cfg *config.Config, notifier notifier.Notifier) (*InformerWatcher, error) {
@@ -102,8 +103,9 @@ func (w *InformerWatcher) Start() error {
 		return fmt.Errorf("failed to sync informer caches")
 	}
 
-	// Set the startup flag AFTER caches are synced
+	// Set the sync done flag AFTER caches are synced
 	w.mu.Lock()
+	w.syncDone = true
 	w.isStarted = true
 	w.mu.Unlock()
 
@@ -199,10 +201,10 @@ func (w *InformerWatcher) createResourceEventHandler(resourceConfig config.Resou
 		AddFunc: func(obj interface{}) {
 			// Skip notifications during startup sync
 			w.mu.RLock()
-			started := w.isStarted
+			syncDone := w.syncDone
 			w.mu.RUnlock()
 
-			if !started {
+			if !syncDone {
 				log.Printf("[%s] Resource discovered during startup sync - skipping notification", resourceKind)
 				return
 			}
@@ -211,10 +213,10 @@ func (w *InformerWatcher) createResourceEventHandler(resourceConfig config.Resou
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			// Skip notifications during startup sync
 			w.mu.RLock()
-			started := w.isStarted
+			syncDone := w.syncDone
 			w.mu.RUnlock()
 
-			if !started {
+			if !syncDone {
 				return
 			}
 			w.handleResourceUpdated(oldObj, newObj, resourceConfig, resourceKind)
@@ -222,10 +224,10 @@ func (w *InformerWatcher) createResourceEventHandler(resourceConfig config.Resou
 		DeleteFunc: func(obj interface{}) {
 			// Skip notifications during startup sync
 			w.mu.RLock()
-			started := w.isStarted
+			syncDone := w.syncDone
 			w.mu.RUnlock()
 
-			if !started {
+			if !syncDone {
 				return
 			}
 			w.handleResourceDeleted(obj, resourceConfig, resourceKind)
@@ -239,10 +241,10 @@ func (w *InformerWatcher) createDeploymentEventHandler(resourceConfig config.Res
 		AddFunc: func(obj interface{}) {
 			// Skip notifications during startup sync
 			w.mu.RLock()
-			started := w.isStarted
+			syncDone := w.syncDone
 			w.mu.RUnlock()
 
-			if !started {
+			if !syncDone {
 				log.Printf("[Deployment] Resource discovered during startup sync - will track for important field changes")
 				return
 			}
@@ -251,10 +253,10 @@ func (w *InformerWatcher) createDeploymentEventHandler(resourceConfig config.Res
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			// Skip notifications during startup sync
 			w.mu.RLock()
-			started := w.isStarted
+			syncDone := w.syncDone
 			w.mu.RUnlock()
 
-			if !started {
+			if !syncDone {
 				return
 			}
 			w.handleDeploymentUpdated(oldObj, newObj, resourceConfig)
@@ -262,10 +264,10 @@ func (w *InformerWatcher) createDeploymentEventHandler(resourceConfig config.Res
 		DeleteFunc: func(obj interface{}) {
 			// Skip notifications during startup sync
 			w.mu.RLock()
-			started := w.isStarted
+			syncDone := w.syncDone
 			w.mu.RUnlock()
 
-			if !started {
+			if !syncDone {
 				return
 			}
 			w.handleDeploymentDeleted(obj, resourceConfig)
