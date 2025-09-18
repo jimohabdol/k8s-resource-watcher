@@ -85,7 +85,6 @@ func NewInformerWatcher(cfg *config.Config, notifier notifier.Notifier) (*Inform
 func (w *InformerWatcher) Start() error {
 	log.Printf("Starting Informer-based resource watcher...")
 
-	// Create and start informers for each resource type
 	for _, resourceConfig := range w.config.Resources {
 		if err := w.createInformer(resourceConfig); err != nil {
 			log.Printf("Failed to create informer for %s: %v", resourceConfig.Kind, err)
@@ -198,21 +197,35 @@ func (w *InformerWatcher) createInformer(resourceConfig config.ResourceConfig) e
 func (w *InformerWatcher) createResourceEventHandler(resourceConfig config.ResourceConfig, resourceKind string) cache.ResourceEventHandlerFuncs {
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			if !w.isStarted {
+			// Skip notifications during startup sync
+			w.mu.RLock()
+			started := w.isStarted
+			w.mu.RUnlock()
+
+			if !started {
 				log.Printf("[%s] Resource discovered during startup sync - skipping notification", resourceKind)
 				return
 			}
 			w.handleResourceAdded(obj, resourceConfig, resourceKind)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			if !w.isStarted {
+			// Skip notifications during startup sync
+			w.mu.RLock()
+			started := w.isStarted
+			w.mu.RUnlock()
+
+			if !started {
 				return
 			}
 			w.handleResourceUpdated(oldObj, newObj, resourceConfig, resourceKind)
 		},
 		DeleteFunc: func(obj interface{}) {
 			// Skip notifications during startup sync
-			if !w.isStarted {
+			w.mu.RLock()
+			started := w.isStarted
+			w.mu.RUnlock()
+
+			if !started {
 				return
 			}
 			w.handleResourceDeleted(obj, resourceConfig, resourceKind)
